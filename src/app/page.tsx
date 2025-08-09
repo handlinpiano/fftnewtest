@@ -6,11 +6,18 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [stats, setStats] = useState<{ quanta: number; writePos: number }>({ quanta: 0, writePos: 0 });
+  const [qps, setQps] = useState<number>(0);
+  const prevQuantaRef = useRef<number>(0);
+  const prevTimeRef = useRef<number>(0);
+  const [wasmReady, setWasmReady] = useState<boolean | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const silentDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const animationRef = useRef<number | null>(null);
   const latestFrameRef = useRef<Float32Array | null>(null);
+  const sabDataRef = useRef<Float32Array | null>(null);
+  const sabIndexRef = useRef<Int32Array | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -25,8 +32,21 @@ export default function Home() {
       ctx.fillStyle = "#0b0b0b";
       ctx.fillRect(0, 0, width, height);
 
-      const frame = latestFrameRef.current;
-      if (frame) {
+      // Read latest samples from the ring buffer if available
+      const sabData = sabDataRef.current;
+      const sabIndex = sabIndexRef.current;
+      if (sabData && sabIndex) {
+        const cap = sabData.length;
+        const w = Atomics.load(sabIndex, 0);
+        const frameLen = 128;
+        const frame = new Float32Array(frameLen);
+        // Copy last quantum ending at w (exclusive)
+        let start = w - frameLen;
+        if (start < 0) start += cap;
+        for (let i = 0; i < frameLen; i++) {
+          const idx = (start + i) % cap;
+          frame[i] = sabData[idx];
+        }
         ctx.strokeStyle = "#00eaff";
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -42,9 +62,28 @@ export default function Home() {
       animationRef.current = requestAnimationFrame(draw);
     }
 
+    // Simple UI stats poller (not critical path)
+    const uiInterval = setInterval(() => {
+      const idx = sabIndexRef.current;
+      if (idx) {
+        const writePos = Atomics.load(idx, 0);
+        const quanta = Atomics.load(idx, 1);
+        setStats({ writePos, quanta });
+        const now = performance.now();
+        if (prevTimeRef.current !== 0) {
+          const dtSec = (now - prevTimeRef.current) / 1000;
+          const dq = quanta - prevQuantaRef.current;
+          if (dtSec > 0) setQps(dq / dtSec);
+        }
+        prevTimeRef.current = now;
+        prevQuantaRef.current = quanta;
+      }
+    }, 250);
+
     animationRef.current = requestAnimationFrame(draw);
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      clearInterval(uiInterval);
     };
   }, []);
 
@@ -59,10 +98,31 @@ export default function Home() {
       workletNodeRef.current = node;
 
       node.port.onmessage = (e: MessageEvent) => {
-        if (e.data?.type === "frame" && e.data?.data) {
-          latestFrameRef.current = e.data.data as Float32Array;
+        if (e.data?.type === "wasm-status") {
+          setWasmReady(!!e.data.ready);
         }
       };
+
+      // Allocate SharedArrayBuffer ring buffer for zero-copy frames from the worklet
+      const capacity = 128 * 256; // 256 quanta ring (~0.68s at 48kHz)
+      const dataSAB = new SharedArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT);
+      const indexSAB = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+      sabDataRef.current = new Float32Array(dataSAB);
+      sabIndexRef.current = new Int32Array(indexSAB);
+      node.port.postMessage({ type: "init", dataSAB, indexSAB, capacity });
+
+      // Load wasm bytes on main thread and send to worklet for instantiation
+      try {
+        const resp = await fetch("/wasm/audio_processor.wasm", { cache: "no-store" });
+        if (resp.ok) {
+          const bytes = await resp.arrayBuffer();
+          node.port.postMessage({ type: "wasm-bytes", bytes }, [bytes as unknown as ArrayBuffer]);
+        } else {
+          console.warn("WASM fetch failed", resp.status);
+        }
+      } catch (err) {
+        console.warn("WASM fetch error", err);
+      }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -87,6 +147,8 @@ export default function Home() {
   async function stop() {
     try {
       workletNodeRef.current?.disconnect();
+      sabDataRef.current = null;
+      sabIndexRef.current = null;
       silentDestRef.current = null;
       audioContextRef.current?.close();
     } finally {
@@ -103,7 +165,11 @@ export default function Home() {
         <button onClick={isRunning ? stop : start}>{isRunning ? "Stop" : "Start"}</button>
         {error && <span style={{ color: "tomato" }}>{error}</span>}
       </div>
+      <div style={{ color: wasmReady ? "#2ecc71" : wasmReady === false ? "#e74c3c" : "#888" }}>
+        WASM: {wasmReady === null ? "pending" : wasmReady ? "active" : "fallback"}
+      </div>
       <canvas ref={canvasRef} width={800} height={200} style={{ border: "1px solid #333", width: "100%", maxWidth: 900 }} />
+      <div style={{ color: "#888" }}>quanta: {stats.quanta} | writePos: {stats.writePos} | quanta/sec: {qps.toFixed(1)}</div>
       <p style={{ color: "#666" }}>This draws the latest 128-sample quantum from the AudioWorklet.</p>
     </div>
   );
