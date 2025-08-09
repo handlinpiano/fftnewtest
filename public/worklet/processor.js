@@ -36,6 +36,9 @@ class PassthroughProcessor extends AudioWorkletProcessor {
           const ptr = exp.init(this.capacity);
           this.inputPtr = ptr; // byte offset in linear memory
           this.inputView = new Float32Array(this.mem.buffer, this.inputPtr, this.capacity);
+          // sampleRate not available in Worklet global by default; use AudioWorkletGlobalScope sampleRate
+          // per spec, a global `sampleRate` exists in the worklet scope
+          try { exp.set_sample_rate(sampleRate); } catch (_) {}
           this.wasmReady = true;
           this.port.postMessage({ type: 'wasm-status', ready: true });
         } catch (err) {
@@ -79,6 +82,14 @@ class PassthroughProcessor extends AudioWorkletProcessor {
       if (this.wasmReady && this.wasm) {
         this.wasm.exports.set_write_pos(w);
         this.wasm.exports.process_quantum(frame.length);
+        // Throttle RMS posts to avoid flooding (every 8 quanta)
+        if ((Atomics.load(this.sharedIndex, 1) & 7) === 0) {
+          const rms = this.wasm.exports.get_last_rms();
+          const bin = this.wasm.exports.get_last_peak_bin();
+          const freqHz = this.wasm.exports.get_last_peak_freq_hz();
+          const mag = this.wasm.exports.get_last_peak_mag();
+          this.port.postMessage({ type: 'metrics', rms, bin, freqHz, mag });
+        }
       }
     }
 

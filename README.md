@@ -111,5 +111,5 @@ Notes:
 - `npm run dev` — Next.js dev server (Turbopack)
 - `npm run build` — Next.js production build
 - `npm run start` — Start production server
-- `npm run lint` — ESLint
+- ` n yg,yiug.jb ;ol/    run lint` — ESLint
 - `npm run build:wasm` — Build Rust WASM → `public/wasm/audio_processor.wasm`

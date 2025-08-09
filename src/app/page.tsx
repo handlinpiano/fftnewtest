@@ -11,6 +11,8 @@ export default function Home() {
   const prevQuantaRef = useRef<number>(0);
   const prevTimeRef = useRef<number>(0);
   const [wasmReady, setWasmReady] = useState<boolean | null>(null);
+  const [rms, setRms] = useState<number | null>(null);
+  const [fft, setFft] = useState<{ bin: number; freqHz: number; mag: number } | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const silentDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
@@ -100,6 +102,9 @@ export default function Home() {
       node.port.onmessage = (e: MessageEvent) => {
         if (e.data?.type === "wasm-status") {
           setWasmReady(!!e.data.ready);
+        } else if (e.data?.type === "metrics") {
+          setRms(e.data.rms as number);
+          setFft({ bin: e.data.bin as number, freqHz: e.data.freqHz as number, mag: e.data.mag as number });
         }
       };
 
@@ -167,6 +172,10 @@ export default function Home() {
       </div>
       <div style={{ color: wasmReady ? "#2ecc71" : wasmReady === false ? "#e74c3c" : "#888" }}>
         WASM: {wasmReady === null ? "pending" : wasmReady ? "active" : "fallback"}
+      </div>
+      <div style={{ color: "#888" }}>RMS: {rms !== null ? rms.toFixed(5) : "—"}</div>
+      <div style={{ color: "#888" }}>
+        FFT: {fft ? `bin ${fft.bin}, ${fft.freqHz.toFixed(2)} Hz, mag ${fft.mag.toFixed(4)}` : "—"}
       </div>
       <canvas ref={canvasRef} width={800} height={200} style={{ border: "1px solid #333", width: "100%", maxWidth: 900 }} />
       <div style={{ color: "#888" }}>quanta: {stats.quanta} | writePos: {stats.writePos} | quanta/sec: {qps.toFixed(1)}</div>
