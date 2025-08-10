@@ -12,12 +12,16 @@ export default function Home() {
   const prevTimeRef = useRef<number>(0);
   const [wasmReady, setWasmReady] = useState<boolean | null>(null);
   const [rms, setRms] = useState<number | null>(null);
+  const [peak, setPeak] = useState<number | null>(null);
   const [fft, setFft] = useState<{ bin: number; freqHz: number; mag: number } | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const silentDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const animationRef = useRef<number | null>(null);
   const latestFrameRef = useRef<Float32Array | null>(null);
+  const [fftBand, setFftBand] = useState<Float32Array | null>(null);
+  const [fftBandStartBin, setFftBandStartBin] = useState<number>(0);
+  const [superBand, setSuperBand] = useState<{ mags: Float32Array; startHz: number; binHz: number } | null>(null);
   const sabDataRef = useRef<Float32Array | null>(null);
   const sabIndexRef = useRef<Int32Array | null>(null);
 
@@ -104,12 +108,21 @@ export default function Home() {
           setWasmReady(!!e.data.ready);
         } else if (e.data?.type === "metrics") {
           setRms(e.data.rms as number);
+          if (e.data.peak !== undefined) setPeak(e.data.peak as number);
           setFft({ bin: e.data.bin as number, freqHz: e.data.freqHz as number, mag: e.data.mag as number });
+          if (e.data.band) {
+            setFftBand(e.data.band as Float32Array);
+            if (e.data.bandStartBin !== undefined) setFftBandStartBin(e.data.bandStartBin as number);
+          }
+          if (e.data.superBand && e.data.superStartHz !== undefined && e.data.superBinHz !== undefined) {
+            setSuperBand({ mags: e.data.superBand as Float32Array, startHz: e.data.superStartHz as number, binHz: e.data.superBinHz as number });
+          }
         }
       };
 
       // Allocate SharedArrayBuffer ring buffer for zero-copy frames from the worklet
-      const capacity = 128 * 256; // 256 quanta ring (~0.68s at 48kHz)
+      // Need at least 2 * FFT_N (2 * 32768) samples for decimate-by-2 32k FFT
+      const capacity = 128 * 512; // 65536 samples
       const dataSAB = new SharedArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT);
       const indexSAB = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
       sabDataRef.current = new Float32Array(dataSAB);
@@ -173,11 +186,39 @@ export default function Home() {
       <div style={{ color: wasmReady ? "#2ecc71" : wasmReady === false ? "#e74c3c" : "#888" }}>
         WASM: {wasmReady === null ? "pending" : wasmReady ? "active" : "fallback"}
       </div>
-      <div style={{ color: "#888" }}>RMS: {rms !== null ? rms.toFixed(5) : "—"}</div>
+      <div style={{ color: "#888" }}>RMS: {rms !== null ? rms.toFixed(7) : "—"} {peak !== null ? ` | pk ${peak.toFixed(5)}` : ""}</div>
       <div style={{ color: "#888" }}>
         FFT: {fft ? `bin ${fft.bin}, ${fft.freqHz.toFixed(2)} Hz, mag ${fft.mag.toFixed(4)}` : "—"}
       </div>
       <canvas ref={canvasRef} width={800} height={200} style={{ border: "1px solid #333", width: "100%", maxWidth: 900 }} />
+      {fftBand && (
+        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+          {(() => {
+            const arr = Array.from(fftBand);
+            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            const pts = arr.map((v, i) => {
+              const n = Math.max(0, Math.min(1, v / max));
+              return `${i},${1 - n}`;
+            }).join(" ");
+            return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#ffaa00" strokeWidth={0.02} points={pts} /></svg>);
+          })()}
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>FFT 420–460 Hz (raw bins)</div>
+        </div>
+      )}
+      {superBand && (
+        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+          {(() => {
+            const arr = Array.from(superBand.mags);
+            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            const pts = arr.map((v, i) => {
+              const n = Math.max(0, Math.min(1, v / max));
+              return `${i},${1 - n}`;
+            }).join(" ");
+            return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#33ff88" strokeWidth={0.02} points={pts} /></svg>);
+          })()}
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Super-res 420–460 Hz (4 shifts)</div>
+        </div>
+      )}
       <div style={{ color: "#888" }}>quanta: {stats.quanta} | writePos: {stats.writePos} | quanta/sec: {qps.toFixed(1)}</div>
       <p style={{ color: "#666" }}>This draws the latest 128-sample quantum from the AudioWorklet.</p>
     </div>

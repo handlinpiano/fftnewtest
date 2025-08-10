@@ -72,7 +72,13 @@ class PassthroughProcessor extends AudioWorkletProcessor {
       for (let i = 0; i < frame.length; i++) {
         const sample = frame[i];
         this.sharedData[w] = sample;
-        if (this.wasmReady && this.inputView) this.inputView[w] = sample;
+        if (this.wasmReady && this.inputView) {
+          // Refresh view if memory grew
+          if (this.mem && this.inputView.buffer !== this.mem.buffer) {
+            this.inputView = new Float32Array(this.mem.buffer, this.inputPtr, this.capacity);
+          }
+          this.inputView[w] = sample;
+        }
         w++; if (w === cap) w = 0;
       }
       this.writePos = w;
@@ -82,13 +88,34 @@ class PassthroughProcessor extends AudioWorkletProcessor {
       if (this.wasmReady && this.wasm) {
         this.wasm.exports.set_write_pos(w);
         this.wasm.exports.process_quantum(frame.length);
-        // Throttle RMS posts to avoid flooding (every 8 quanta)
+        // Throttle posts (every 8 quanta)
         if ((Atomics.load(this.sharedIndex, 1) & 7) === 0) {
           const rms = this.wasm.exports.get_last_rms();
           const bin = this.wasm.exports.get_last_peak_bin();
           const freqHz = this.wasm.exports.get_last_peak_freq_hz();
           const mag = this.wasm.exports.get_last_peak_mag();
-          this.port.postMessage({ type: 'metrics', rms, bin, freqHz, mag });
+          // Per-quantum peak (sanity check that input is non-zero)
+          let peak = 0.0;
+          for (let i = 0; i < frame.length; i++) {
+            const v = Math.abs(frame[i]);
+            if (v > peak) peak = v;
+          }
+          // FFT compact display
+          const bptr = this.wasm.exports.get_band_display_ptr ? this.wasm.exports.get_band_display_ptr() : 0;
+          const blen = this.wasm.exports.get_band_display_len ? this.wasm.exports.get_band_display_len() : 0;
+          const bstart = this.wasm.exports.get_band_display_start_bin ? this.wasm.exports.get_band_display_start_bin() : 0;
+          const bdisp = bptr && blen ? new Float32Array(this.mem.buffer, bptr, blen) : null;
+          const bdispCopy = bdisp ? new Float32Array(bdisp) : null;
+
+          // Super-resolution interleaved band (SHIFT_COUNT interleaves)
+          const sptr = this.wasm.exports.get_super_band_ptr ? this.wasm.exports.get_super_band_ptr() : 0;
+          const slen = this.wasm.exports.get_super_band_len ? this.wasm.exports.get_super_band_len() : 0;
+          const sst = this.wasm.exports.get_super_band_start_hz ? this.wasm.exports.get_super_band_start_hz() : 0;
+          const sbin = this.wasm.exports.get_super_band_bin_hz ? this.wasm.exports.get_super_band_bin_hz() : 0;
+          const sarr = sptr && slen ? new Float32Array(this.mem.buffer, sptr, slen) : null;
+          const sCopy = sarr ? new Float32Array(sarr) : null;
+
+          this.port.postMessage({ type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen });
         }
       }
     }
