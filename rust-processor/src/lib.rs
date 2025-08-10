@@ -47,6 +47,7 @@ static mut SUPER_BAND: MaybeUninit<[f32; SUPER_BAND_CAP]> = MaybeUninit::uninit(
 static mut SUPER_BAND_LEN: usize = 0;
 static mut SUPER_BAND_START_HZ: f32 = 0.0;
 static mut SUPER_BAND_BIN_HZ: f32 = 0.0; // effective bin width (fs_eff/FFT_N/SHIFT_COUNT)
+const ENABLE_SUPER_BAND: bool = false; // disable full-rate super-res band for battery tests
 // Zoom-FFT style baseband around 440 Hz (proof of concept)
 const ZOOM_BINS: usize = 2048; // UI bins in cents grid
 const ZOOM_SPAN_CENTS: f32 = 120.0; // +/-120 cents
@@ -84,6 +85,12 @@ static mut LAST_WINDOW_TOTAL_SAMPLES: u64 = 0;
 // Stacking (time-delayed windows)
 const STACK_T: usize = 1; // number of time-delayed windows to stack (1 = disabled)
 const HOP_DEC: usize = 64; // hop in decimated samples (64 dec = 128 original)
+
+// 2× capture buffer (downsampled instantaneous demod magnitude across the current window)
+const CAP2_N: usize = 1024; // 32768/1024 = 32x downsample
+const CAP2_DECIM: usize = FFT_N / CAP2_N; // must be integer
+static mut CAP2_MAG: MaybeUninit<[f32; CAP2_N]> = MaybeUninit::uninit();
+static mut CAP2_LEN: usize = 0;
 
 #[no_mangle]
 pub unsafe extern "C" fn init(capacity: usize) -> *mut f32 {
@@ -241,7 +248,8 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
             }
 
             // Frequency-shifted spectra (SHIFT_COUNT) using Blackman-Harris window
-            if let Some(cplan) = &CFFT_PLAN {
+            if ENABLE_SUPER_BAND {
+                if let Some(cplan) = &CFFT_PLAN {
                 // Apply BH window to decimated time buffer and generate complex buffer
                 let mut cbuf: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); FFT_N];
                 let bh = BH.as_ptr();
@@ -319,9 +327,10 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                     f0_super_hz = SUPER_BAND_START_HZ + (max_i as f32) * SUPER_BAND_BIN_HZ;
                 }
                 LAST_F0_SUPER_HZ = f0_super_hz;
-
-                // True baseband zoom at 440 Hz: heterodyne + decimate + small FFT
-                if let Some(zplan) = &ZOOM_PLAN {
+                }
+            }
+            // True baseband zoom at 440 Hz: heterodyne + decimate + small FFT
+            if let Some(zplan) = &ZOOM_PLAN {
                     let zoom_time = ZOOM_TIME.as_mut_ptr();
                     // Mix down at 440 Hz and decimate by ZOOM_DECIM (exact fill of ZOOM_N)
                     let w0 = 2.0 * core::f32::consts::PI * BAND_CENTER_HZ / fs_eff;
@@ -400,7 +409,6 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                             (*zoom_mags)[i] = m;
                         }
                     }
-                }
             }
 
             // 2× lock-in demod across windows (use inter-window phase drift)
@@ -412,11 +420,33 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                 let w = 2.0 * core::f32::consts::PI * f2_ref_hz / fs_eff;
                 let mut z_re = 0.0f32;
                 let mut z_im = 0.0f32;
+                // Fill capture buffer with coarse decimated instantaneous magnitude of demod product
+                let cap2 = CAP2_MAG.as_mut_ptr();
+                let mut ci = 0usize;
+                let mut acc_re_i = 0.0f32;
+                let mut acc_im_i = 0.0f32;
+                let mut n_acc = 0usize;
                 for n in 0..FFT_N {
                     let s = (*TIMEBUF.as_ptr())[n];
                     z_re += s * (w * (n as f32)).cos();
                     z_im += -s * (w * (n as f32)).sin();
+                    // instantaneous demod sample (rectangular lowpass + decimate)
+                    acc_re_i += s * (w * (n as f32)).cos();
+                    acc_im_i += -s * (w * (n as f32)).sin();
+                    n_acc += 1;
+                    if n_acc == CAP2_DECIM {
+                        if ci < CAP2_N {
+                            let mre = acc_re_i / (CAP2_DECIM as f32);
+                            let mim = acc_im_i / (CAP2_DECIM as f32);
+                            (*cap2)[ci] = (mre * mre + mim * mim).sqrt();
+                            ci += 1;
+                        }
+                        acc_re_i = 0.0;
+                        acc_im_i = 0.0;
+                        n_acc = 0;
+                    }
                 }
+                CAP2_LEN = core::cmp::min(ci, CAP2_N);
                 // Apply absolute phase offset for window start (align to absolute time)
                 let n0_dec = (TOTAL_SAMPLES as f32) * 0.5 - (FFT_N as f32);
                 let phi0 = w * n0_dec;
@@ -530,6 +560,7 @@ pub unsafe extern "C" fn get_last_peak_freq_hz() -> f32 { (LAST_PEAK_BIN as f32)
 #[no_mangle]
 pub unsafe extern "C" fn get_last_peak_mag() -> f32 { LAST_PEAK_MAG }
 
+#[no_mangle]
 pub unsafe extern "C" fn get_band_display_ptr() -> *const f32 { BAND_DISP.as_ptr() as *const f32 }
 #[no_mangle]
 pub unsafe extern "C" fn get_band_display_len() -> usize { BAND_LEN }
@@ -576,5 +607,11 @@ pub unsafe extern "C" fn get_zoom_len() -> usize { ZOOM_BINS }
 pub unsafe extern "C" fn get_zoom_start_cents() -> f32 { ZOOM_START_CENTS }
 #[no_mangle]
 pub unsafe extern "C" fn get_zoom_bin_cents() -> f32 { ZOOM_BIN_CENTS }
+
+// 2× capture exports
+#[no_mangle]
+pub unsafe extern "C" fn get_cap2_ptr() -> *const f32 { CAP2_MAG.as_ptr() as *const f32 }
+#[no_mangle]
+pub unsafe extern "C" fn get_cap2_len() -> usize { CAP2_LEN }
 
 

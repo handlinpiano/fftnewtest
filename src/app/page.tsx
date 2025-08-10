@@ -26,6 +26,7 @@ export default function Home() {
   const [superBand, setSuperBand] = useState<{ mags: Float32Array; startHz: number; binHz: number } | null>(null);
   const [zoom, setZoom] = useState<{ mags: Float32Array; startCents: number; binCents: number } | null>(null);
   const [harm, setHarm] = useState<{ freqs: Float32Array; mags: Float32Array } | null>(null);
+  const [cap2, setCap2] = useState<Float32Array | null>(null);
   const [lock2, setLock2] = useState<{ cents: number; mag: number } | null>(null);
   const [lock2Ratio, setLock2Ratio] = useState<number | null>(null);
   const sabDataRef = useRef<Float32Array | null>(null);
@@ -139,9 +140,8 @@ export default function Home() {
           if (e.data.band) {
             setFftBand(e.data.band as Float32Array);
           }
-          if (e.data.superBand && e.data.superStartHz !== undefined && e.data.superBinHz !== undefined) {
-            setSuperBand({ mags: e.data.superBand as Float32Array, startHz: e.data.superStartHz as number, binHz: e.data.superBinHz as number });
-          }
+          // superBand disabled for battery test
+          setSuperBand(null);
           if (e.data.harm) {
             setHarm({ freqs: e.data.harm.freqs as Float32Array, mags: e.data.harm.mags as Float32Array });
           }
@@ -153,6 +153,9 @@ export default function Home() {
           }
           if (e.data.zoomMags && e.data.zoomStartCents !== undefined && e.data.zoomBinCents !== undefined) {
             setZoom({ mags: e.data.zoomMags as Float32Array, startCents: e.data.zoomStartCents as number, binCents: e.data.zoomBinCents as number });
+          }
+          if (e.data.cap2) {
+            setCap2(e.data.cap2 as Float32Array);
           }
           if (e.data.procMsAvg !== undefined) {
             setProcStats({
@@ -269,24 +272,7 @@ export default function Home() {
           <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>FFT A4 ±120c (raw bins)</div>
         </div>
       )}
-      {superBand && (
-        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
-          {(() => {
-            const arr = Array.from(superBand.mags);
-            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
-            const pts = arr.map((v, i) => {
-              const n = Math.max(0, Math.min(1, v / max));
-              return `${i},${1 - n}`;
-            }).join(" ");
-            return (
-              <svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none">
-                <polyline fill="none" stroke="#00ff7f" strokeWidth={0.02} points={pts} />
-              </svg>
-            );
-          })()}
-          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Super-res band</div>
-        </div>
-      )}
+      {/* superBand plot disabled for battery test */}
       {zoom && (
         <div style={{ width: "100%", maxWidth: 900, height: 300, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
           {(() => {
@@ -326,6 +312,26 @@ export default function Home() {
               return `${fac[i]}x: ${hf.toFixed(2)} Hz (folded ${folded.toFixed(2)} Hz) mag ${mag}`;
             });
             return <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{rows.join("\n")}</pre>;
+          })()}
+        </div>
+      )}
+      {cap2 && (
+        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+          {(() => {
+            const arr = Array.from(cap2);
+            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            const pts = arr.map((v, i) => {
+              const n = Math.max(0, Math.min(1, v / max));
+              return `${i},${1 - n}`;
+            }).join(" ");
+            return (
+              <>
+                <svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none">
+                  <polyline fill="none" stroke="#ffcc00" strokeWidth={0.02} points={pts} />
+                </svg>
+                <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>2× lock-in capture (per-window, coarse magnitude)</div>
+              </>
+            );
           })()}
         </div>
       )}

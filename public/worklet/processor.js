@@ -112,13 +112,10 @@ class PassthroughProcessor extends AudioWorkletProcessor {
           const bdisp = bptr && blen ? new Float32Array(this.mem.buffer, bptr, blen) : null;
           const bdispCopy = bdisp ? new Float32Array(bdisp) : null;
 
-          // Super-resolution interleaved band (SHIFT_COUNT interleaves)
-          const sptr = this.wasm.exports.get_super_band_ptr ? this.wasm.exports.get_super_band_ptr() : 0;
-          const slen = this.wasm.exports.get_super_band_len ? this.wasm.exports.get_super_band_len() : 0;
-          const sst = this.wasm.exports.get_super_band_start_hz ? this.wasm.exports.get_super_band_start_hz() : 0;
-          const sbin = this.wasm.exports.get_super_band_bin_hz ? this.wasm.exports.get_super_band_bin_hz() : 0;
-          const sarr = sptr && slen ? new Float32Array(this.mem.buffer, sptr, slen) : null;
-          const sCopy = sarr ? new Float32Array(sarr) : null;
+          // Super-resolution interleaved band disabled for battery test
+          const sCopy = null;
+          const sst = 0;
+          const sbin = 0;
 
           // Basic per-callback timing stats
           if (t0) {
@@ -172,7 +169,15 @@ class PassthroughProcessor extends AudioWorkletProcessor {
             }
           }
 
-          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen, harm, lockin2Cents, lockin2Mag, lockin2Ratio, zoomMags: zoomCopy, zoomStartCents, zoomBinCents };
+          // 2× capture buffer
+          let cap2Copy = null;
+          if (this.wasm.exports.get_cap2_ptr && this.wasm.exports.get_cap2_len) {
+            const cptr = this.wasm.exports.get_cap2_ptr();
+            const clen = this.wasm.exports.get_cap2_len();
+            if (cptr && clen) cap2Copy = new Float32Array(this.mem.buffer, cptr, clen).slice();
+          }
+
+          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen, harm, lockin2Cents, lockin2Mag, lockin2Ratio, zoomMags: zoomCopy, zoomStartCents, zoomBinCents, cap2: cap2Copy };
           if (includeTiming && this.procCount) {
             payload.procMsAvg = this.procSumMs / this.procCount;
             payload.procMsMax = this.procMaxMs || 0;
