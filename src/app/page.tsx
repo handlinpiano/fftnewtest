@@ -13,6 +13,8 @@ export default function Home() {
   const [wasmReady, setWasmReady] = useState<boolean | null>(null);
   const [rms, setRms] = useState<number | null>(null);
   const [fft, setFft] = useState<{ bin: number; freqHz: number; mag: number } | null>(null);
+  const [disp, setDisp] = useState<Float32Array | null>(null);
+  const [zoom, setZoom] = useState<{ mags: Float32Array; freqs: Float32Array } | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const silentDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
@@ -105,6 +107,10 @@ export default function Home() {
         } else if (e.data?.type === "metrics") {
           setRms(e.data.rms as number);
           setFft({ bin: e.data.bin as number, freqHz: e.data.freqHz as number, mag: e.data.mag as number });
+          if (e.data.disp) setDisp(e.data.disp as Float32Array);
+          if (e.data.zoomMags && e.data.zoomFreqs) {
+            setZoom({ mags: e.data.zoomMags as Float32Array, freqs: e.data.zoomFreqs as Float32Array });
+          }
         }
       };
 
@@ -177,6 +183,48 @@ export default function Home() {
       <div style={{ color: "#888" }}>
         FFT: {fft ? `bin ${fft.bin}, ${fft.freqHz.toFixed(2)} Hz, mag ${fft.mag.toFixed(4)}` : "—"}
       </div>
+      {disp && (
+        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+          {(() => {
+            const arr = Array.from(disp);
+            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            return (
+              <svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none">
+                <polyline
+                  fill="none"
+                  stroke="#ffcc00"
+                  strokeWidth={0.02}
+                  points={arr
+                    .map((v, i) => {
+                      const n = Math.max(0, Math.min(1, v / max));
+                      return `${i},${1 - n}`; // 0 at bottom, 1 at top
+                    })
+                    .join(" ")}
+                />
+              </svg>
+            );
+          })()}
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>420–460 Hz</div>
+        </div>
+      )}
+      {zoom && (
+        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+          {(() => {
+            const arr = Array.from(zoom.mags);
+            // Light smoothing to reduce jaggies for a cleaner peak
+            for (let i = 1; i + 1 < arr.length; i++) {
+              arr[i] = (arr[i - 1] + 2 * arr[i] + arr[i + 1]) / 4;
+            }
+            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            const pts = arr.map((v, i) => {
+              const n = Math.max(0, Math.min(1, v / max));
+              return `${i},${1 - n}`;
+            }).join(" ");
+            return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#33ff88" strokeWidth={0.02} points={pts} /></svg>);
+          })()}
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Zoom 0–+120 cents</div>
+        </div>
+      )}
       <canvas ref={canvasRef} width={800} height={200} style={{ border: "1px solid #333", width: "100%", maxWidth: 900 }} />
       <div style={{ color: "#888" }}>quanta: {stats.quanta} | writePos: {stats.writePos} | quanta/sec: {qps.toFixed(1)}</div>
       <p style={{ color: "#666" }}>This draws the latest 128-sample quantum from the AudioWorklet.</p>

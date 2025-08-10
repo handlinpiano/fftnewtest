@@ -39,6 +39,11 @@ class PassthroughProcessor extends AudioWorkletProcessor {
           // sampleRate not available in Worklet global by default; use AudioWorkletGlobalScope sampleRate
           // per spec, a global `sampleRate` exists in the worklet scope
           try { exp.set_sample_rate(sampleRate); } catch (_) {}
+          // Configure zoom: center params; center will auto-track peak, but set defaults
+          if (exp.set_zoom_params) {
+            // center_hz, span_cents, center_width_cents, bpc_center, bpc_edge, enabled
+            exp.set_zoom_params(440.0, 120.0, 60.0, 2.0, 0.25, true);
+          }
           this.wasmReady = true;
           this.port.postMessage({ type: 'wasm-status', ready: true });
         } catch (err) {
@@ -86,9 +91,23 @@ class PassthroughProcessor extends AudioWorkletProcessor {
         if ((Atomics.load(this.sharedIndex, 1) & 7) === 0) {
           const rms = this.wasm.exports.get_last_rms();
           const bin = this.wasm.exports.get_last_peak_bin();
-          const freqHz = this.wasm.exports.get_last_peak_freq_hz();
+          const freqHz = this.wasm.exports.get_last_peak_freq_hz_interp ? this.wasm.exports.get_last_peak_freq_hz_interp() : this.wasm.exports.get_last_peak_freq_hz();
           const mag = this.wasm.exports.get_last_peak_mag();
-          this.port.postMessage({ type: 'metrics', rms, bin, freqHz, mag });
+          // Also include compact display slice around 420-460 Hz
+          const dispPtr = this.wasm.exports.get_display_bins_ptr();
+          const dispLen = this.wasm.exports.get_display_bins_len();
+          const disp = new Float32Array(this.mem.buffer, dispPtr, dispLen);
+          // Zoomed dense band (re-enable)
+          const zoomLen = this.wasm.exports.get_zoom_len ? this.wasm.exports.get_zoom_len() : 0;
+          const zmPtr = this.wasm.exports.get_zoom_mags_ptr ? this.wasm.exports.get_zoom_mags_ptr() : 0;
+          const zfPtr = this.wasm.exports.get_zoom_freqs_ptr ? this.wasm.exports.get_zoom_freqs_ptr() : 0;
+          const zoomMags = zoomLen && zmPtr ? new Float32Array(this.mem.buffer, zmPtr, zoomLen) : null;
+          const zoomFreqs = zoomLen && zfPtr ? new Float32Array(this.mem.buffer, zfPtr, zoomLen) : null;
+          // Copy to avoid holding onto the shared backing array
+          const dispCopy = new Float32Array(disp);
+          const zoomMagsCopy = zoomMags ? new Float32Array(zoomMags) : null;
+          const zoomFreqsCopy = zoomFreqs ? new Float32Array(zoomFreqs) : null;
+          this.port.postMessage({ type: 'metrics', rms, bin, freqHz, mag, disp: dispCopy, zoomMags: zoomMagsCopy, zoomFreqs: zoomFreqsCopy });
         }
       }
     }
