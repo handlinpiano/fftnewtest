@@ -157,7 +157,22 @@ class PassthroughProcessor extends AudioWorkletProcessor {
             lockin2Ratio = this.wasm.exports.get_lockin2_ratio();
           }
 
-          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen, harm, lockin2Cents, lockin2Mag, lockin2Ratio };
+          // Zoom-FFT (baseband around 440 Hz, ±120c)
+          let zoomCopy = null;
+          let zoomStartCents = undefined;
+          let zoomBinCents = undefined;
+          if (this.wasm.exports.get_zoom_ptr && this.wasm.exports.get_zoom_len) {
+            const zptr = this.wasm.exports.get_zoom_ptr();
+            const zlen = this.wasm.exports.get_zoom_len();
+            if (zptr && zlen) {
+              const zarr = new Float32Array(this.mem.buffer, zptr, zlen);
+              zoomCopy = new Float32Array(zarr);
+              if (this.wasm.exports.get_zoom_start_cents) zoomStartCents = this.wasm.exports.get_zoom_start_cents();
+              if (this.wasm.exports.get_zoom_bin_cents) zoomBinCents = this.wasm.exports.get_zoom_bin_cents();
+            }
+          }
+
+          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen, harm, lockin2Cents, lockin2Mag, lockin2Ratio, zoomMags: zoomCopy, zoomStartCents, zoomBinCents };
           if (includeTiming && this.procCount) {
             payload.procMsAvg = this.procSumMs / this.procCount;
             payload.procMsMax = this.procMaxMs || 0;

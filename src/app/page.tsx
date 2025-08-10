@@ -24,6 +24,7 @@ export default function Home() {
   const animationRef = useRef<number | null>(null);
   const [fftBand, setFftBand] = useState<Float32Array | null>(null);
   const [superBand, setSuperBand] = useState<{ mags: Float32Array; startHz: number; binHz: number } | null>(null);
+  const [zoom, setZoom] = useState<{ mags: Float32Array; startCents: number; binCents: number } | null>(null);
   const [harm, setHarm] = useState<{ freqs: Float32Array; mags: Float32Array } | null>(null);
   const [lock2, setLock2] = useState<{ cents: number; mag: number } | null>(null);
   const [lock2Ratio, setLock2Ratio] = useState<number | null>(null);
@@ -149,6 +150,9 @@ export default function Home() {
           }
           if (e.data.lockin2Ratio !== undefined) {
             setLock2Ratio(e.data.lockin2Ratio as number);
+          }
+          if (e.data.zoomMags && e.data.zoomStartCents !== undefined && e.data.zoomBinCents !== undefined) {
+            setZoom({ mags: e.data.zoomMags as Float32Array, startCents: e.data.zoomStartCents as number, binCents: e.data.zoomBinCents as number });
           }
           if (e.data.procMsAvg !== undefined) {
             setProcStats({
@@ -281,6 +285,31 @@ export default function Home() {
             );
           })()}
           <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Super-res band</div>
+        </div>
+      )}
+      {zoom && (
+        <div style={{ width: "100%", maxWidth: 900, height: 300, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+          {(() => {
+            const arr = Array.from(zoom.mags);
+            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            const viewW = arr.length;
+            const pts = arr.map((v, i) => {
+              const n = Math.max(0, Math.min(1, v / max));
+              const y = (1 - n) * viewW; // scale y to viewBox height for 1:1 aspect
+              return `${i},${y}`;
+            }).join(" ");
+            return (
+              <svg width="100%" height="100%" viewBox={`0 0 ${viewW} ${viewW}`} preserveAspectRatio="none">
+                <polyline fill="none" stroke="#00ff7f" strokeWidth={2} points={pts} />
+                {(() => {
+                  // No fftshift: 0 cents index derived from start/bin
+                  const zeroIdx = Math.round((-zoom.startCents) / zoom.binCents);
+                  return <line x1={zeroIdx} y1={0} x2={zeroIdx} y2={viewW} stroke="#ffffff" strokeWidth={2} vectorEffect="non-scaling-stroke" />;
+                })()}
+              </svg>
+            );
+          })()}
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Zoom ±120¢ around A4 (baseband)</div>
         </div>
       )}
       {harm && (

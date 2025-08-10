@@ -47,6 +47,21 @@ static mut SUPER_BAND: MaybeUninit<[f32; SUPER_BAND_CAP]> = MaybeUninit::uninit(
 static mut SUPER_BAND_LEN: usize = 0;
 static mut SUPER_BAND_START_HZ: f32 = 0.0;
 static mut SUPER_BAND_BIN_HZ: f32 = 0.0; // effective bin width (fs_eff/FFT_N/SHIFT_COUNT)
+// Zoom-FFT style baseband around 440 Hz (proof of concept)
+const ZOOM_BINS: usize = 2048; // UI bins in cents grid
+const ZOOM_SPAN_CENTS: f32 = 120.0; // +/-120 cents
+static mut ZOOM_MAGS: MaybeUninit<[f32; ZOOM_BINS]> = MaybeUninit::uninit();
+static mut ZOOM_START_CENTS: f32 = -ZOOM_SPAN_CENTS;
+static mut ZOOM_BIN_CENTS: f32 = 0.0;
+const ZOOM_N: usize = 2048; // FFT size
+const ZOOM_DECIM: usize = 16; // choose so ZOOM_N * ZOOM_DECIM == FFT_N (2048*16=32768)
+static mut ZOOM_TIME: MaybeUninit<[Complex32; ZOOM_N]> = MaybeUninit::uninit();
+static mut ZOOM_FREQ: MaybeUninit<[Complex32; ZOOM_N]> = MaybeUninit::uninit();
+static mut ZOOM_FILL: usize = 0;
+static mut ZOOM_PLAN: Option<std::sync::Arc<dyn Cfft<f32>>> = None;
+static mut ZOOM_HANN: MaybeUninit<[f32; ZOOM_N]> = MaybeUninit::uninit();
+// Super-resolution in baseband: store magnitudes of SHIFT_COUNT shifted FFTs
+static mut ZOOM_SUPER_MAG: MaybeUninit<[f32; ZOOM_N * SHIFT_COUNT]> = MaybeUninit::uninit();
 // Lock-in demod outputs for 2× harmonic
 static mut LAST_LOCKIN_2X_CENTS: f32 = 0.0;
 static mut LAST_LOCKIN_2X_MAG: f32 = 0.0;
@@ -101,6 +116,13 @@ pub unsafe extern "C" fn init(capacity: usize) -> *mut f32 {
         // Complex FFT plan
         let mut cpl = CfftPlanner::<f32>::new();
         CFFT_PLAN = Some(cpl.plan_fft_forward(FFT_N));
+        // Zoom FFT plan
+        ZOOM_PLAN = Some(cpl.plan_fft_forward(ZOOM_N));
+        // Zoom Hann window
+        let zhw = ZOOM_HANN.as_mut_ptr();
+        for i in 0..ZOOM_N {
+            (*zhw)[i] = 0.5 - 0.5 * (2.0 * core::f32::consts::PI * (i as f32) / (ZOOM_N as f32)).cos();
+        }
     }
     ptr
 }
@@ -297,6 +319,88 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                     f0_super_hz = SUPER_BAND_START_HZ + (max_i as f32) * SUPER_BAND_BIN_HZ;
                 }
                 LAST_F0_SUPER_HZ = f0_super_hz;
+
+                // True baseband zoom at 440 Hz: heterodyne + decimate + small FFT
+                if let Some(zplan) = &ZOOM_PLAN {
+                    let zoom_time = ZOOM_TIME.as_mut_ptr();
+                    // Mix down at 440 Hz and decimate by ZOOM_DECIM (exact fill of ZOOM_N)
+                    let w0 = 2.0 * core::f32::consts::PI * BAND_CENTER_HZ / fs_eff;
+                    let mut zi = 0usize;
+                    let mut n_accum = 0usize;
+                    let mut acc_re = 0.0f32;
+                    let mut acc_im = 0.0f32;
+                    for n in 0..FFT_N {
+                        let s = (*timebuf)[n];
+                        let ang = w0 * (n as f32);
+                        // Mix by exp(-j*w0*n) to shift 440 Hz to DC
+                        acc_re += s * ang.cos();
+                        acc_im += s * -ang.sin();
+                        n_accum += 1;
+                        if n_accum == ZOOM_DECIM {
+                            // Rectangular average; for sharper passband we could later replace with FIR
+                            (*zoom_time)[zi] = Complex32::new(acc_re / (ZOOM_DECIM as f32), acc_im / (ZOOM_DECIM as f32));
+                            zi += 1;
+                            n_accum = 0;
+                            acc_re = 0.0;
+                            acc_im = 0.0;
+                        }
+                    }
+                    if zi == ZOOM_N {
+                        // Baseband super-resolution: perform SHIFT_COUNT micro-shifts
+                        let zhw = ZOOM_HANN.as_ptr();
+                        let zoom_freq = ZOOM_FREQ.as_mut_ptr();
+                        let super_mag = ZOOM_SUPER_MAG.as_mut_ptr();
+                        // Zero super buffer
+                        for i in 0..(ZOOM_N * SHIFT_COUNT) { (*super_mag)[i] = 0.0; }
+                        for n in 0..SHIFT_COUNT {
+                            // Apply Hann and per-sample complex shift with fractional bin offset n/SHIFT_COUNT
+                            let theta = -2.0 * core::f32::consts::PI * (n as f32) / ((ZOOM_N * SHIFT_COUNT) as f32);
+                            let step = Complex32::new(theta.cos(), theta.sin());
+                            let mut phase = Complex32::new(1.0, 0.0);
+                            let mut buf: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); ZOOM_N];
+                            for k in 0..ZOOM_N {
+                                let w = (*zhw)[k];
+                                let v = (*zoom_time)[k] * phase;
+                                buf[k] = Complex32::new(v.re * w, v.im * w);
+                                phase = phase * step;
+                            }
+                            // FFT
+                            zplan.process(&mut buf);
+                            // Magnitudes with fftshift (DC -> center)
+                            for k in 0..ZOOM_N {
+                                let ks = (k + ZOOM_N / 2) % ZOOM_N;
+                                let v = buf[k];
+                                let m = (v.re * v.re + v.im * v.im).sqrt();
+                                (*super_mag)[ks * SHIFT_COUNT + n] = m;
+                            }
+                        }
+                        // Map to fixed cents grid by nearest micro-bin
+                        let fs_zoom = fs_eff / (ZOOM_DECIM as f32);
+                        let zoom_mags = ZOOM_MAGS.as_mut_ptr();
+                        let span = ZOOM_SPAN_CENTS;
+                        let start_c = -span;
+                        let bin_c = (2.0 * span) / (ZOOM_BINS as f32);
+                        ZOOM_START_CENTS = start_c;
+                        ZOOM_BIN_CENTS = bin_c;
+                        for i in 0..ZOOM_BINS {
+                            let cents = start_c + (i as f32) * bin_c;
+                            let freq = BAND_CENTER_HZ * (2.0_f32).powf(cents / 1200.0);
+                            let f_rel = freq - BAND_CENTER_HZ; // baseband
+                            // fractional micro-bin index in fftshifted grid: DC at N/2
+                            let mut fbin = (f_rel / fs_zoom) * (ZOOM_N as f32) + 0.5 * (ZOOM_N as f32);
+                            // wrap to [0, N)
+                            fbin = fbin % (ZOOM_N as f32);
+                            if fbin < 0.0 { fbin += ZOOM_N as f32; }
+                            let micro = fbin * (SHIFT_COUNT as f32);
+                            let mut midx = micro.round() as isize;
+                            let max_micro = (ZOOM_N * SHIFT_COUNT) as isize;
+                            // wrap into [0, N*SHIFT)
+                            midx = ((midx % max_micro) + max_micro) % max_micro;
+                            let m = (*super_mag)[midx as usize];
+                            (*zoom_mags)[i] = m;
+                        }
+                    }
+                }
             }
 
             // 2× lock-in demod across windows (use inter-window phase drift)
@@ -462,5 +566,15 @@ pub unsafe extern "C" fn get_lockin1_ratio() -> f32 { LAST_LOCKIN_1X_RATIO }
 pub unsafe extern "C" fn get_lockin1_cents() -> f32 { LAST_LOCKIN_1X_CENTS }
 #[no_mangle]
 pub unsafe extern "C" fn get_lockin1_mag() -> f32 { LAST_LOCKIN_1X_MAG }
+
+// Zoom view exports (fixed bins around 440 Hz)
+#[no_mangle]
+pub unsafe extern "C" fn get_zoom_ptr() -> *const f32 { ZOOM_MAGS.as_ptr() as *const f32 }
+#[no_mangle]
+pub unsafe extern "C" fn get_zoom_len() -> usize { ZOOM_BINS }
+#[no_mangle]
+pub unsafe extern "C" fn get_zoom_start_cents() -> f32 { ZOOM_START_CENTS }
+#[no_mangle]
+pub unsafe extern "C" fn get_zoom_bin_cents() -> f32 { ZOOM_BIN_CENTS }
 
 
