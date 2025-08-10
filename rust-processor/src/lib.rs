@@ -17,7 +17,7 @@ static mut LAST_RMS: f32 = 0.0;
 // Minimal FFT analyzer state (fixed window = 32768 after decimation-by-2)
 // Effective sample rate becomes sample_rate/2 (e.g., 24 kHz if input is 48 kHz)
 const FFT_N: usize = 32768;
-const SHIFT_COUNT: usize = 4; // frequency shifts for super-resolution
+const SHIFT_COUNT: usize = 32; // frequency shifts for super-resolution
 static mut HANN: MaybeUninit<[f32; FFT_N]> = MaybeUninit::uninit();
 static mut TIMEBUF: MaybeUninit<[f32; FFT_N]> = MaybeUninit::uninit();
 static mut FREQBUF: MaybeUninit<[Complex32; FFT_N/2 + 1]> = MaybeUninit::uninit();
@@ -39,11 +39,14 @@ static mut BAND_DISP: MaybeUninit<[f32; BAND_DISP_CAP]> = MaybeUninit::uninit();
 static mut BAND_LEN: usize = 0;
 static mut BAND_START_BIN: usize = 0;
 // Super-resolution interleaved band using SHIFT_COUNT shifts (raw interleaved bins)
-const SUPER_BAND_CAP: usize = 1024;
+const SUPER_BAND_CAP: usize = 4096;
 static mut SUPER_BAND: MaybeUninit<[f32; SUPER_BAND_CAP]> = MaybeUninit::uninit();
 static mut SUPER_BAND_LEN: usize = 0;
 static mut SUPER_BAND_START_HZ: f32 = BAND_MIN_HZ;
 static mut SUPER_BAND_BIN_HZ: f32 = 0.0; // effective bin width (fs_eff/FFT_N/SHIFT_COUNT)
+// Stacking (time-delayed windows)
+const STACK_T: usize = 1; // number of time-delayed windows to stack (1 = disabled)
+const HOP_DEC: usize = 64; // hop in decimated samples (64 dec = 128 original)
 
 #[no_mangle]
 pub unsafe extern "C" fn init(capacity: usize) -> *mut f32 {
@@ -174,16 +177,35 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                 for n in 0..SHIFT_COUNT {
                     let theta = -2.0 * core::f32::consts::PI * (n as f32) / ((FFT_N * SHIFT_COUNT) as f32);
                     let step = Complex32::new(theta.cos(), theta.sin());
-                    let mut phase = Complex32::new(1.0, 0.0);
-                    let mut shifted = cbuf.clone();
-                    for i in 0..FFT_N {
-                        shifted[i] = shifted[i] * phase;
-                        phase = phase * step;
+                    // Stack STACK_T time-delayed windows coherently
+                    let mut acc_re: Vec<f32> = vec![0.0; FFT_N];
+                    let mut acc_im: Vec<f32> = vec![0.0; FFT_N];
+                    for t in 0..STACK_T {
+                        let hop = t * HOP_DEC;
+                        let mut phase = Complex32::new(1.0, 0.0);
+                        let mut shifted = cbuf.clone();
+                        // Apply shift and time delay phase alignment: extra phase for hop samples
+                        // Equivalent to multiplying by e^{-j 2pi n/(N*SHIFT_COUNT) * i} and then aligning by +hop
+                        for i in 0..FFT_N {
+                            shifted[i] = shifted[i] * phase;
+                            phase = phase * step;
+                        }
+                        cplan.process(&mut shifted);
+                        // Phase align bins for time shift hop: multiply each bin k by e^{+j 2pi f_k * hop / fs_eff}
+                        for b in start_bin..=end_bin {
+                            let fk = (b as f32) * bin_hz;
+                            let ang = 2.0 * core::f32::consts::PI * fk * (hop as f32) / fs_eff;
+                            let rot = Complex32::new(ang.cos(), ang.sin());
+                            let v = shifted[b] * rot;
+                            acc_re[b] += v.re;
+                            acc_im[b] += v.im;
+                        }
                     }
-                    cplan.process(&mut shifted);
-                    // Fill super-res interleaved band and update best peak
+                    // Magnitudes from averaged accumulators
                     for b in start_bin..=end_bin {
-                        let m = shifted[b].norm();
+                        let re = acc_re[b] / (STACK_T as f32);
+                        let im = acc_im[b] / (STACK_T as f32);
+                        let m = (re * re + im * im).sqrt();
                         if m > best_mag { best_mag = m; best_bin = b; }
                         let idx = (b - start_bin) * SHIFT_COUNT + n;
                         if idx < SUPER_BAND_CAP { (*sband)[idx] = m; }

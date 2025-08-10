@@ -39,6 +39,9 @@ class PassthroughProcessor extends AudioWorkletProcessor {
           // sampleRate not available in Worklet global by default; use AudioWorkletGlobalScope sampleRate
           // per spec, a global `sampleRate` exists in the worklet scope
           try { exp.set_sample_rate(sampleRate); } catch (_) {}
+          // Timing budget per quantum in ms
+          this.sampleRate = typeof sampleRate === 'number' ? sampleRate : 48000;
+          this.budgetMs = (this.frameLength / this.sampleRate) * 1000;
           this.wasmReady = true;
           this.port.postMessage({ type: 'wasm-status', ready: true });
         } catch (err) {
@@ -52,6 +55,7 @@ class PassthroughProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs) {
+    const t0 = (globalThis.performance && performance.now) ? performance.now() : 0;
     const input = inputs[0];
     const output = outputs[0];
 
@@ -89,7 +93,8 @@ class PassthroughProcessor extends AudioWorkletProcessor {
         this.wasm.exports.set_write_pos(w);
         this.wasm.exports.process_quantum(frame.length);
         // Throttle posts (every 8 quanta)
-        if ((Atomics.load(this.sharedIndex, 1) & 7) === 0) {
+        const qc = Atomics.load(this.sharedIndex, 1);
+        if ((qc & 7) === 0) {
           const rms = this.wasm.exports.get_last_rms();
           const bin = this.wasm.exports.get_last_peak_bin();
           const freqHz = this.wasm.exports.get_last_peak_freq_hz();
@@ -115,7 +120,30 @@ class PassthroughProcessor extends AudioWorkletProcessor {
           const sarr = sptr && slen ? new Float32Array(this.mem.buffer, sptr, slen) : null;
           const sCopy = sarr ? new Float32Array(sarr) : null;
 
-          this.port.postMessage({ type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen });
+          // Basic per-callback timing stats
+          if (t0) {
+            const dt = performance.now() - t0;
+            this.procCount = (this.procCount || 0) + 1;
+            this.procSumMs = (this.procSumMs || 0) + dt;
+            this.procMaxMs = Math.max(this.procMaxMs || 0, dt);
+            const budget = this.budgetMs || ((this.frameLength / (this.sampleRate || 48000)) * 1000);
+            if (dt > budget) this.procOverruns = (this.procOverruns || 0) + 1;
+          }
+
+          // Post metrics (every 8) plus timing overview (every 32)
+          const includeTiming = (qc & 31) === 0;
+          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen };
+          if (includeTiming && this.procCount) {
+            payload.procMsAvg = this.procSumMs / this.procCount;
+            payload.procMsMax = this.procMaxMs || 0;
+            payload.procOverruns = this.procOverruns || 0;
+            payload.procBudgetMs = this.budgetMs || ((this.frameLength / (this.sampleRate || 48000)) * 1000);
+            // decay counts to avoid unbounded growth
+            this.procCount = 0;
+            this.procSumMs = 0;
+            this.procMaxMs = 0;
+          }
+          this.port.postMessage(payload);
         }
       }
     }

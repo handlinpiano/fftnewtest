@@ -8,12 +8,16 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState<{ quanta: number; writePos: number }>({ quanta: 0, writePos: 0 });
   const [qps, setQps] = useState<number>(0);
+  const [fps, setFps] = useState<number>(0);
   const prevQuantaRef = useRef<number>(0);
   const prevTimeRef = useRef<number>(0);
+  const fpsFrameCountRef = useRef<number>(0);
+  const fpsLastTimeRef = useRef<number>(0);
   const [wasmReady, setWasmReady] = useState<boolean | null>(null);
   const [rms, setRms] = useState<number | null>(null);
   const [peak, setPeak] = useState<number | null>(null);
   const [fft, setFft] = useState<{ bin: number; freqHz: number; mag: number } | null>(null);
+  const [procStats, setProcStats] = useState<{ avgMs?: number; maxMs?: number; budgetMs?: number; overruns?: number }>({});
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const silentDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
@@ -26,14 +30,19 @@ export default function Home() {
   const sabIndexRef = useRef<Int32Array | null>(null);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
     function draw() {
-      const width = canvas.width;
-      const height = canvas.height;
+      const canvasEl = canvasRef.current;
+      if (!canvasEl) {
+        animationRef.current = requestAnimationFrame(draw);
+        return;
+      }
+      const ctx = canvasEl.getContext("2d");
+      if (!ctx) {
+        animationRef.current = requestAnimationFrame(draw);
+        return;
+      }
+      const width = canvasEl.width;
+      const height = canvasEl.height;
       ctx.clearRect(0, 0, width, height);
       ctx.fillStyle = "#0b0b0b";
       ctx.fillRect(0, 0, width, height);
@@ -63,6 +72,21 @@ export default function Home() {
           else ctx.lineTo(x, y);
         }
         ctx.stroke();
+      }
+
+      // FPS meter (lightweight)
+      fpsFrameCountRef.current += 1;
+      const nowTs = performance.now();
+      if (fpsLastTimeRef.current === 0) {
+        fpsLastTimeRef.current = nowTs;
+      } else {
+        const dt = nowTs - fpsLastTimeRef.current;
+        if (dt >= 500) { // update every 0.5s
+          const fpsVal = (fpsFrameCountRef.current / dt) * 1000;
+          setFps(fpsVal);
+          fpsFrameCountRef.current = 0;
+          fpsLastTimeRef.current = nowTs;
+        }
       }
 
       animationRef.current = requestAnimationFrame(draw);
@@ -117,12 +141,20 @@ export default function Home() {
           if (e.data.superBand && e.data.superStartHz !== undefined && e.data.superBinHz !== undefined) {
             setSuperBand({ mags: e.data.superBand as Float32Array, startHz: e.data.superStartHz as number, binHz: e.data.superBinHz as number });
           }
+          if (e.data.procMsAvg !== undefined) {
+            setProcStats({
+              avgMs: e.data.procMsAvg as number,
+              maxMs: e.data.procMsMax as number,
+              budgetMs: e.data.procBudgetMs as number,
+              overruns: e.data.procOverruns as number,
+            });
+          }
         }
       };
 
       // Allocate SharedArrayBuffer ring buffer for zero-copy frames from the worklet
-      // Need at least 2 * FFT_N (2 * 32768) samples for decimate-by-2 32k FFT
-      const capacity = 128 * 512; // 65536 samples
+      // For 32k FFT after decimate-by-2: need at least 2 * 32768 = 65536 samples
+      const capacity = 128 * 512; // 65536 samples; enough to fill one 32k decimated window
       const dataSAB = new SharedArrayBuffer(capacity * Float32Array.BYTES_PER_ELEMENT);
       const indexSAB = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
       sabDataRef.current = new Float32Array(dataSAB);
@@ -188,6 +220,9 @@ export default function Home() {
       </div>
       <div style={{ color: "#888" }}>RMS: {rms !== null ? rms.toFixed(7) : "—"} {peak !== null ? ` | pk ${peak.toFixed(5)}` : ""}</div>
       <div style={{ color: "#888" }}>
+        UI: {`FPS ${fps.toFixed(0)}`} | Worklet: {procStats.avgMs !== undefined ? `${procStats.avgMs.toFixed(3)} ms avg, ${procStats.maxMs?.toFixed(3)} ms max (budget ${procStats.budgetMs?.toFixed(3)} ms), overruns ${procStats.overruns}` : "—"}
+      </div>
+      <div style={{ color: "#888" }}>
         FFT: {fft ? `bin ${fft.bin}, ${fft.freqHz.toFixed(2)} Hz, mag ${fft.mag.toFixed(4)}` : "—"}
       </div>
       <canvas ref={canvasRef} width={800} height={200} style={{ border: "1px solid #333", width: "100%", maxWidth: 900 }} />
@@ -216,7 +251,9 @@ export default function Home() {
             }).join(" ");
             return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#33ff88" strokeWidth={0.02} points={pts} /></svg>);
           })()}
-          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Super-res 420–460 Hz (4 shifts)</div>
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>
+            Super-res 420–460 Hz {superBand ? `(${superBand.mags.length} bins @ ${superBand.binHz.toFixed(3)} Hz/bin)` : ""}
+          </div>
         </div>
       )}
       <div style={{ color: "#888" }}>quanta: {stats.quanta} | writePos: {stats.writePos} | quanta/sec: {qps.toFixed(1)}</div>
