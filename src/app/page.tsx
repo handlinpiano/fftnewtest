@@ -22,10 +22,11 @@ export default function Home() {
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const silentDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const animationRef = useRef<number | null>(null);
-  const latestFrameRef = useRef<Float32Array | null>(null);
   const [fftBand, setFftBand] = useState<Float32Array | null>(null);
-  const [fftBandStartBin, setFftBandStartBin] = useState<number>(0);
   const [superBand, setSuperBand] = useState<{ mags: Float32Array; startHz: number; binHz: number } | null>(null);
+  const [harm, setHarm] = useState<{ freqs: Float32Array; mags: Float32Array } | null>(null);
+  const [lock2, setLock2] = useState<{ cents: number; mag: number } | null>(null);
+  const [lock2Ratio, setLock2Ratio] = useState<number | null>(null);
   const sabDataRef = useRef<Float32Array | null>(null);
   const sabIndexRef = useRef<Int32Array | null>(null);
 
@@ -136,10 +137,18 @@ export default function Home() {
           setFft({ bin: e.data.bin as number, freqHz: e.data.freqHz as number, mag: e.data.mag as number });
           if (e.data.band) {
             setFftBand(e.data.band as Float32Array);
-            if (e.data.bandStartBin !== undefined) setFftBandStartBin(e.data.bandStartBin as number);
           }
           if (e.data.superBand && e.data.superStartHz !== undefined && e.data.superBinHz !== undefined) {
             setSuperBand({ mags: e.data.superBand as Float32Array, startHz: e.data.superStartHz as number, binHz: e.data.superBinHz as number });
+          }
+          if (e.data.harm) {
+            setHarm({ freqs: e.data.harm.freqs as Float32Array, mags: e.data.harm.mags as Float32Array });
+          }
+          if (e.data.lockin2Cents !== undefined && e.data.lockin2Mag !== undefined) {
+            setLock2({ cents: e.data.lockin2Cents as number, mag: e.data.lockin2Mag as number });
+          }
+          if (e.data.lockin2Ratio !== undefined) {
+            setLock2Ratio(e.data.lockin2Ratio as number);
           }
           if (e.data.procMsAvg !== undefined) {
             setProcStats({
@@ -189,8 +198,8 @@ export default function Home() {
       silentDestRef.current = silent;
 
       setIsRunning(true);
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -211,7 +220,7 @@ export default function Home() {
   return (
     <div style={{ padding: 24, display: "grid", gap: 16 }}>
       <h1>Audio Worklet Test: Time-Domain View</h1>
-      <div style={{ display: "flex", gap: 8 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <button onClick={isRunning ? stop : start}>{isRunning ? "Stop" : "Start"}</button>
         {error && <span style={{ color: "tomato" }}>{error}</span>}
       </div>
@@ -225,6 +234,22 @@ export default function Home() {
       <div style={{ color: "#888" }}>
         FFT: {fft ? `bin ${fft.bin}, ${fft.freqHz.toFixed(2)} Hz, mag ${fft.mag.toFixed(4)}` : "—"}
       </div>
+      {(lock2 || lock2Ratio !== null || (harm && fft)) && (() => {
+        const r = lock2Ratio ?? 1;
+        const ppm = (r - 1) * 1_000_000;
+        const fftRef = fft ? fft.freqHz : null;
+        const harm2 = harm && harm.freqs.length > 0 ? (harm.freqs[0] as number) : null;
+        const ratio2Fft = fftRef && harm2 ? harm2 / (2 * fftRef) : null;
+        return (
+          <div style={{ color: "#ccc" }}>
+            Lock-in 2×: {lock2 ? `${lock2.cents.toFixed(2)}¢` : "—"}
+            {lock2Ratio !== null ? ` | ratio ${r.toFixed(9)}` : ""}
+            {lock2Ratio !== null ? ` | Δppm ${ppm.toFixed(1)}` : ""}
+            {lock2 ? ` | mag ${lock2.mag.toFixed(3)}` : ""}
+            {ratio2Fft ? ` | FFT ratio2 ${ratio2Fft.toFixed(6)}` : ""}
+          </div>
+        );
+      })()}
       <canvas ref={canvasRef} width={800} height={200} style={{ border: "1px solid #333", width: "100%", maxWidth: 900 }} />
       {fftBand && (
         <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
@@ -237,23 +262,83 @@ export default function Home() {
             }).join(" ");
             return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#ffaa00" strokeWidth={0.02} points={pts} /></svg>);
           })()}
-          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>FFT 420–460 Hz (raw bins)</div>
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>FFT A4 ±120c (raw bins)</div>
         </div>
       )}
       {superBand && (
-        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+        <div style={{ width: "100%", maxWidth: 900, paddingTop: "100%", border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
           {(() => {
-            const arr = Array.from(superBand.mags);
-            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
-            const pts = arr.map((v, i) => {
+            // Zoom to ±15 cents around 440 Hz
+            const a4Hz = 440;
+            const cents = 15;
+            const factor = Math.pow(2, cents / 1200);
+            const fMin = a4Hz / factor;
+            const fMax = a4Hz * factor;
+            const binHz = superBand.binHz;
+            const bandStartHz = superBand.startHz;
+            const totalBins = superBand.mags.length;
+            const startIdx = Math.max(0, Math.floor((fMin - bandStartHz) / binHz));
+            const endIdx = Math.min(totalBins - 1, Math.ceil((fMax - bandStartHz) / binHz));
+            const subStartIdx = Math.min(startIdx, endIdx);
+            const subEndIdx = Math.max(startIdx, endIdx);
+            const subArr = Array.from(superBand.mags.slice(subStartIdx, subEndIdx + 1));
+            const max = subArr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            const L = subArr.length;
+            const pts = subArr.map((v, i) => {
               const n = Math.max(0, Math.min(1, v / max));
-              return `${i},${1 - n}`;
+              return `${i},${(1 - n) * L}`;
             }).join(" ");
-            return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#33ff88" strokeWidth={0.02} points={pts} /></svg>);
+
+            // Folded harmonic lines within zoomed band
+            let harmLines = "";
+            if (harm && harm.freqs && harm.freqs.length > 0) {
+              const factors = [2, 3, 4, 6, 8];
+              const colors = ["#ff0000", "#ff9500", "#ffcc00", "#34c759", "#007aff"]; // 2x..8x
+              const freqs = Array.from(harm.freqs);
+              const subStartHz = bandStartHz + subStartIdx * binHz;
+              for (let i = 0; i < freqs.length && i < factors.length; i++) {
+                const n = factors[i];
+                const foldedHz = freqs[i] > 0 ? freqs[i] / n : 0;
+                const fx = (foldedHz - subStartHz) / binHz; // relative to zoomed segment
+                if (fx >= 0 && fx <= subArr.length - 1) {
+                  const color = colors[i] || "#ff6688";
+                  harmLines += `<line x1="${fx}" y1="0" x2="${fx}" y2="${L}" stroke="${color}" stroke-width="3" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-opacity="1" />`;
+                }
+              }
+            }
+
+            // A4 line relative to zoomed segment
+            const subStartHz = bandStartHz + subStartIdx * binHz;
+            const a4x = (a4Hz - subStartHz) / binHz;
+            const a4Line = (a4x >= 0 && a4x <= subArr.length - 1)
+              ? `<line x1="${a4x}" y1="0" x2="${a4x}" y2="${L}" stroke="#ffffff" stroke-width="2" vector-effect="non-scaling-stroke" stroke-opacity="1" stroke-linecap="round" />`
+              : "";
+
+            return (
+              <svg style={{ position: "absolute", inset: 0 }} width="100%" height="100%" viewBox={`0 0 ${L} ${L}`} preserveAspectRatio="none">
+                <polyline fill="none" stroke="#33ff88" strokeWidth={0.02} points={pts} />
+                <g dangerouslySetInnerHTML={{ __html: a4Line + harmLines }} />
+              </svg>
+            );
           })()}
-          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>
-            Super-res 420–460 Hz {superBand ? `(${superBand.mags.length} bins @ ${superBand.binHz.toFixed(3)} Hz/bin)` : ""}
-          </div>
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Super-res A4 ±120c {superBand ? `(${superBand.mags.length} bins @ ${superBand.binHz.toFixed(3)} Hz/bin)` : ""}</div>
+        </div>
+      )}
+      {harm && (
+        <div style={{ color: "#888", display: "grid", gap: 4 }}>
+          <div>Harmonics (2x,3x,4x,6x,8x)</div>
+          {(() => {
+            const fac = [2,3,4,6,8];
+            const f = Array.from(harm.freqs);
+            const m = Array.from(harm.mags);
+            const rows = f.map((hf, i) => {
+              const n = fac[i];
+              const folded = hf > 0 ? hf / n : 0;
+              const mag = (m[i] ?? 0).toFixed(4);
+              return `${fac[i]}x: ${hf.toFixed(2)} Hz (folded ${folded.toFixed(2)} Hz) mag ${mag}`;
+            });
+            return <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{rows.join("\n")}</pre>;
+          })()}
         </div>
       )}
       <div style={{ color: "#888" }}>quanta: {stats.quanta} | writePos: {stats.writePos} | quanta/sec: {qps.toFixed(1)}</div>

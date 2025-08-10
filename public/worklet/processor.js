@@ -132,7 +132,32 @@ class PassthroughProcessor extends AudioWorkletProcessor {
 
           // Post metrics (every 8) plus timing overview (every 32)
           const includeTiming = (qc & 31) === 0;
-          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen };
+          // Harmonics (2x,3x,4x,6x,8x)
+          let harm = null;
+          if (this.wasm.exports.get_harmonics_len) {
+            const hlen = this.wasm.exports.get_harmonics_len();
+            const hfp = this.wasm.exports.get_harmonics_freq_ptr ? this.wasm.exports.get_harmonics_freq_ptr() : 0;
+            const hmp = this.wasm.exports.get_harmonics_mag_ptr ? this.wasm.exports.get_harmonics_mag_ptr() : 0;
+            if (hlen && hfp && hmp) {
+              const hf = new Float32Array(this.mem.buffer, hfp, hlen);
+              const hm = new Float32Array(this.mem.buffer, hmp, hlen);
+              harm = { freqs: new Float32Array(hf), mags: new Float32Array(hm) };
+            }
+          }
+
+          // Lock-in demod outputs (2x)
+          let lockin2Cents = undefined;
+          let lockin2Mag = undefined;
+          let lockin2Ratio = undefined;
+          if (this.wasm.exports.get_lockin2_cents && this.wasm.exports.get_lockin2_mag) {
+            lockin2Cents = this.wasm.exports.get_lockin2_cents();
+            lockin2Mag = this.wasm.exports.get_lockin2_mag();
+          }
+          if (this.wasm.exports.get_lockin2_ratio) {
+            lockin2Ratio = this.wasm.exports.get_lockin2_ratio();
+          }
+
+          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen, harm, lockin2Cents, lockin2Mag, lockin2Ratio };
           if (includeTiming && this.procCount) {
             payload.procMsAvg = this.procSumMs / this.procCount;
             payload.procMsMax = this.procMaxMs || 0;

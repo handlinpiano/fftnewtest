@@ -28,12 +28,15 @@ static mut CFFT_PLAN: Option<std::sync::Arc<dyn Cfft<f32>>> = None;
 static mut SAMPLE_RATE: f32 = 48000.0;
 static mut LAST_PEAK_BIN: usize = 0;
 static mut LAST_PEAK_MAG: f32 = 0.0;
-// Compact FFT display (linear mapping over 0..Nyquist)
-const FFT_DISP_BINS: usize = 256;
-static mut FFT_DISP: MaybeUninit<[f32; FFT_DISP_BINS]> = MaybeUninit::uninit();
-// Band-limited display around A4 range (raw FFT bins, no interpolation)
-const BAND_MIN_HZ: f32 = 420.0;
-const BAND_MAX_HZ: f32 = 460.0;
+// Harmonics (2x, 3x, 4x, 6x, 8x) outputs
+const HARM_COUNT: usize = 5;
+static HARM_FACTORS: [f32; HARM_COUNT] = [2.0, 3.0, 4.0, 6.0, 8.0];
+static mut HARM_FREQS: MaybeUninit<[f32; HARM_COUNT]> = MaybeUninit::uninit();
+static mut HARM_MAGS: MaybeUninit<[f32; HARM_COUNT]> = MaybeUninit::uninit();
+// Band centered at A4 with ±120 cents span
+const BAND_CENTER_HZ: f32 = 440.0;
+const BAND_SPAN_CENTS: f32 = 120.0;
+// Band-limited display around target range (raw FFT bins, no interpolation)
 const BAND_DISP_CAP: usize = 256; // capacity; actual length set at runtime
 static mut BAND_DISP: MaybeUninit<[f32; BAND_DISP_CAP]> = MaybeUninit::uninit();
 static mut BAND_LEN: usize = 0;
@@ -42,8 +45,27 @@ static mut BAND_START_BIN: usize = 0;
 const SUPER_BAND_CAP: usize = 4096;
 static mut SUPER_BAND: MaybeUninit<[f32; SUPER_BAND_CAP]> = MaybeUninit::uninit();
 static mut SUPER_BAND_LEN: usize = 0;
-static mut SUPER_BAND_START_HZ: f32 = BAND_MIN_HZ;
+static mut SUPER_BAND_START_HZ: f32 = 0.0;
 static mut SUPER_BAND_BIN_HZ: f32 = 0.0; // effective bin width (fs_eff/FFT_N/SHIFT_COUNT)
+// Lock-in demod outputs for 2× harmonic
+static mut LAST_LOCKIN_2X_CENTS: f32 = 0.0;
+static mut LAST_LOCKIN_2X_MAG: f32 = 0.0;
+// Inter-window lock-in state for 2×: previous complex demod sample
+static mut LOCKIN2_PREV_RE: f32 = 0.0;
+static mut LOCKIN2_PREV_IM: f32 = 0.0;
+static mut LOCKIN2_HAS_PREV: bool = false;
+static mut LAST_F0_SUPER_HZ: f32 = 0.0;
+static mut LAST_LOCKIN_2X_RATIO: f32 = 1.0;
+// k=1 lock-in (fundamental) inter-window state and outputs
+static mut LOCKIN1_PREV_RE: f32 = 0.0;
+static mut LOCKIN1_PREV_IM: f32 = 0.0;
+static mut LOCKIN1_HAS_PREV: bool = false;
+static mut LAST_LOCKIN_1X_RATIO: f32 = 1.0;
+static mut LAST_LOCKIN_1X_CENTS: f32 = 0.0;
+static mut LAST_LOCKIN_1X_MAG: f32 = 0.0;
+// Global sample counter to compute true Δt between windows
+static mut TOTAL_SAMPLES: u64 = 0;
+static mut LAST_WINDOW_TOTAL_SAMPLES: u64 = 0;
 // Stacking (time-delayed windows)
 const STACK_T: usize = 1; // number of time-delayed windows to stack (1 = disabled)
 const HOP_DEC: usize = 64; // hop in decimated samples (64 dec = 128 original)
@@ -109,6 +131,7 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
         if idx == cap { idx = 0; }
     }
     LAST_RMS = (sum_sq / n as f32).sqrt();
+    TOTAL_SAMPLES = TOTAL_SAMPLES.saturating_add(n as u64);
 
     // Reset band lengths by default; will be set when window processed
     BAND_LEN = 0;
@@ -138,18 +161,64 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
             let mut scratch = plan.make_scratch_vec();
             let _ = plan.process_with_scratch(&mut (*timebuf), &mut (*freqbuf), &mut scratch);
 
-            // Magnitude peak search
+            // Determine band bounds (±120 cents around 440 Hz at effective fs)
             let fb = &(*freqbuf);
-            let mut peak_bin = 0usize;
+            let fs_eff = SAMPLE_RATE * 0.5;
+            let cents_ratio = (2.0f32).powf(BAND_SPAN_CENTS / 1200.0);
+            let band_min_hz = BAND_CENTER_HZ / cents_ratio;
+            let band_max_hz = BAND_CENTER_HZ * cents_ratio;
+            let bin_hz = fs_eff / (FFT_N as f32);
+            let mut start_bin_band = ((band_min_hz / bin_hz).ceil() as usize).min(fb.len() - 1);
+            let mut end_bin_band = ((band_max_hz / bin_hz).floor() as usize).min(fb.len() - 1);
+            if end_bin_band < start_bin_band { end_bin_band = start_bin_band; }
+            // Magnitude peak search limited to band
+            let mut peak_bin = start_bin_band;
             let mut peak_mag = 0.0f32;
-            for (i, c) in fb.iter().enumerate() {
-                let m = c.norm_sqr();
-                if m > peak_mag { peak_mag = m; peak_bin = i; }
+            for b in start_bin_band..=end_bin_band {
+                let m = fb[b].norm_sqr();
+                if m > peak_mag { peak_mag = m; peak_bin = b; }
             }
             LAST_PEAK_BIN = peak_bin;
             LAST_PEAK_MAG = peak_mag.sqrt();
 
-            // Frequency-shifted spectra (SHIFT_COUNT=4) using Blackman-Harris window
+            // Harmonic extraction from base FFT magnitudes using parabolic interpolation
+            let f0_hz = (LAST_PEAK_BIN as f32) * (fs_eff / (FFT_N as f32));
+            let mut out_f = HARM_FREQS.as_mut_ptr();
+            let mut out_m = HARM_MAGS.as_mut_ptr();
+            for (i, k) in HARM_FACTORS.iter().enumerate() {
+                let target_hz = f0_hz * (*k);
+                if target_hz >= fs_eff {
+                    (*out_f)[i] = 0.0;
+                    (*out_m)[i] = 0.0;
+                    continue;
+                }
+                let x = target_hz / bin_hz;
+                // Search a small neighborhood around expected bin to find the local peak
+                let mut b0 = x.floor() as isize - 3;
+                if b0 < 1 { b0 = 1; }
+                let mut b1 = x.ceil() as isize + 3;
+                let maxb = (fb.len() as isize) - 2;
+                if b1 > maxb { b1 = maxb; }
+                let mut best_b = b0 as usize;
+                let mut best_m = 0.0f32;
+                let mut b = b0 as usize;
+                while (b as isize) <= b1 {
+                    let m = fb[b].norm();
+                    if m > best_m { best_m = m; best_b = b; }
+                    b += 1;
+                }
+                // Parabolic interpolation at the chosen peak bin
+                let y1 = fb[best_b - 1].norm();
+                let y2 = fb[best_b].norm();
+                let y3 = fb[best_b + 1].norm();
+                let denom = y1 - 2.0 * y2 + y3;
+                let x_off = if denom.abs() > 1e-12 { 0.5 * (y1 - y3) / denom } else { 0.0 };
+                let freq_est = (best_b as f32 + x_off) * bin_hz;
+                (*out_f)[i] = freq_est;
+                (*out_m)[i] = y2;
+            }
+
+            // Frequency-shifted spectra (SHIFT_COUNT) using Blackman-Harris window
             if let Some(cplan) = &CFFT_PLAN {
                 // Apply BH window to decimated time buffer and generate complex buffer
                 let mut cbuf: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); FFT_N];
@@ -157,14 +226,16 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                 for i in 0..FFT_N {
                     cbuf[i] = Complex32::new((*timebuf)[i] * (*bh)[i], 0.0);
                 }
-                let fs_eff = SAMPLE_RATE * 0.5;
                 // For each shift n, multiply by e^{-j 2pi n/(FFT_N*SHIFT_COUNT) * i} and FFT
                 let mut best_mag = 0.0f32;
                 let mut best_bin = LAST_PEAK_BIN;
                 // Prepare band info
                 let bin_hz = fs_eff / (FFT_N as f32);
-                let mut start_bin = ((BAND_MIN_HZ / bin_hz).ceil() as usize).min(FFT_N/2 - 1);
-                let mut end_bin = ((BAND_MAX_HZ / bin_hz).floor() as usize).min(FFT_N/2 - 1);
+                let cents_ratio = (2.0f32).powf(BAND_SPAN_CENTS / 1200.0);
+                let band_min_hz = BAND_CENTER_HZ / cents_ratio;
+                let band_max_hz = BAND_CENTER_HZ * cents_ratio;
+                let mut start_bin = ((band_min_hz / bin_hz).ceil() as usize).min(FFT_N/2 - 1);
+                let mut end_bin = ((band_max_hz / bin_hz).floor() as usize).min(FFT_N/2 - 1);
                 if end_bin < start_bin { end_bin = start_bin; }
                 let bin_count = end_bin - start_bin + 1;
                 let total_len = core::cmp::min(bin_count * SHIFT_COUNT, SUPER_BAND_CAP);
@@ -213,28 +284,119 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                 }
                 LAST_PEAK_BIN = best_bin;
                 LAST_PEAK_MAG = best_mag;
+
+                // Compute super-res f0 estimate from the A4 super band for lock-in reference
+                let mut f0_super_hz = 0.0f32;
+                if SUPER_BAND_LEN > 0 {
+                    let mut max_v = 0.0f32;
+                    let mut max_i = 0usize;
+                    for i in 0..SUPER_BAND_LEN {
+                        let v = (*sband)[i];
+                        if v > max_v { max_v = v; max_i = i; }
+                    }
+                    f0_super_hz = SUPER_BAND_START_HZ + (max_i as f32) * SUPER_BAND_BIN_HZ;
+                }
+                LAST_F0_SUPER_HZ = f0_super_hz;
             }
 
-            // Build compact FFT display across 0..Nyquist
-            let disp = FFT_DISP.as_mut_ptr();
-            let max_bin = fb.len() - 1;
-            for d in 0..FFT_DISP_BINS {
-                let x = (d as f32) * (max_bin as f32) / ((FFT_DISP_BINS - 1) as f32);
-                let i0 = x.floor() as usize;
-                let i1 = core::cmp::min(i0 + 1, max_bin);
-                let frac = x - (i0 as f32);
-                // linear magnitude for display
-                let m0 = fb[i0].norm();
-                let m1 = fb[i1].norm();
-                (*disp)[d] = m0 * (1.0 - frac) + m1 * frac;
+            // 2× lock-in demod across windows (use inter-window phase drift)
+            let coarse_f0 = (LAST_PEAK_BIN as f32) * (fs_eff / (FFT_N as f32));
+            let f0_ref_hz = if LAST_F0_SUPER_HZ > 0.0 { LAST_F0_SUPER_HZ } else { coarse_f0 };
+            let f2_ref_hz = 2.0 * f0_ref_hz;
+            if f2_ref_hz > 0.0 && f2_ref_hz < fs_eff * 0.9 {
+                // Demod on this window using the same BH-windowed decimated buffer in TIMEBUF
+                let w = 2.0 * core::f32::consts::PI * f2_ref_hz / fs_eff;
+                let mut z_re = 0.0f32;
+                let mut z_im = 0.0f32;
+                for n in 0..FFT_N {
+                    let s = (*TIMEBUF.as_ptr())[n];
+                    z_re += s * (w * (n as f32)).cos();
+                    z_im += -s * (w * (n as f32)).sin();
+                }
+                // Apply absolute phase offset for window start (align to absolute time)
+                let n0_dec = (TOTAL_SAMPLES as f32) * 0.5 - (FFT_N as f32);
+                let phi0 = w * n0_dec;
+                let c0 = phi0.cos();
+                let s0 = phi0.sin();
+                let rot_re = z_re * c0 + z_im * s0;
+                let rot_im = z_im * c0 - z_re * s0;
+                z_re = rot_re;
+                z_im = rot_im;
+                // Measure phase drift from previous window
+                if LOCKIN2_HAS_PREV {
+                    let d_re = z_re * LOCKIN2_PREV_RE + z_im * LOCKIN2_PREV_IM;
+                    let d_im = z_im * LOCKIN2_PREV_RE - z_re * LOCKIN2_PREV_IM;
+                    // Flip sign to align with FFT ratio convention
+                    let delta_phi = -(d_im.atan2(d_re));
+                    // Δt between windows based on true sample count
+                    let dt_samples = (TOTAL_SAMPLES - LAST_WINDOW_TOTAL_SAMPLES) as f32;
+                    let delta_t = dt_samples / SAMPLE_RATE;
+                    let delta_f_hz = delta_phi / (2.0 * core::f32::consts::PI * delta_t);
+                    let ratio = 1.0 + (delta_f_hz / f2_ref_hz);
+                    let safe_ratio = if ratio > 1.0e-12 { ratio } else { 1.0e-12 };
+                    let cents = 1200.0 * (safe_ratio.ln() / core::f32::consts::LN_2);
+                    let mag = (z_re * z_re + z_im * z_im).sqrt() / (FFT_N as f32);
+                    LAST_LOCKIN_2X_RATIO = safe_ratio;
+                    LAST_LOCKIN_2X_CENTS = cents.clamp(-50.0, 50.0);
+                    LAST_LOCKIN_2X_MAG = mag;
+                }
+                // Update previous state
+                LOCKIN2_PREV_RE = z_re;
+                LOCKIN2_PREV_IM = z_im;
+                LOCKIN2_HAS_PREV = true;
+                LAST_WINDOW_TOTAL_SAMPLES = TOTAL_SAMPLES;
+            } else {
+                LAST_LOCKIN_2X_CENTS = 0.0;
+                LAST_LOCKIN_2X_MAG = 0.0;
+                LAST_LOCKIN_2X_RATIO = 1.0;
+            }
+
+            // 1× lock-in sanity (should ≈ 1.0)
+            if f0_ref_hz > 0.0 && f0_ref_hz < fs_eff * 0.9 {
+                let w1 = 2.0 * core::f32::consts::PI * f0_ref_hz / fs_eff;
+                let mut z1_re = 0.0f32;
+                let mut z1_im = 0.0f32;
+                for n in 0..FFT_N {
+                    let s = (*TIMEBUF.as_ptr())[n];
+                    z1_re += s * (w1 * (n as f32)).cos();
+                    z1_im += -s * (w1 * (n as f32)).sin();
+                }
+                // Absolute phase alignment for 1× as well
+                let n0_dec = (TOTAL_SAMPLES as f32) * 0.5 - (FFT_N as f32);
+                let phi0 = w1 * n0_dec;
+                let c0 = phi0.cos();
+                let s0 = phi0.sin();
+                let rot1_re = z1_re * c0 + z1_im * s0;
+                let rot1_im = z1_im * c0 - z1_re * s0;
+                z1_re = rot1_re;
+                z1_im = rot1_im;
+                if LOCKIN1_HAS_PREV {
+                    let d_re = z1_re * LOCKIN1_PREV_RE + z1_im * LOCKIN1_PREV_IM;
+                    let d_im = z1_im * LOCKIN1_PREV_RE - z1_re * LOCKIN1_PREV_IM;
+                    let delta_phi = -(d_im.atan2(d_re));
+                    let dt_samples = (TOTAL_SAMPLES - LAST_WINDOW_TOTAL_SAMPLES) as f32;
+                    let delta_t = dt_samples / SAMPLE_RATE;
+                    let delta_f_hz = delta_phi / (2.0 * core::f32::consts::PI * delta_t);
+                    let ratio = 1.0 + (delta_f_hz / f0_ref_hz);
+                    let safe_ratio = if ratio > 1.0e-12 { ratio } else { 1.0e-12 };
+                    LAST_LOCKIN_1X_RATIO = safe_ratio;
+                    LAST_LOCKIN_1X_CENTS = 1200.0 * (safe_ratio.ln() / core::f32::consts::LN_2);
+                    LAST_LOCKIN_1X_MAG = (z1_re * z1_re + z1_im * z1_im).sqrt() / (FFT_N as f32);
+                }
+                LOCKIN1_PREV_RE = z1_re;
+                LOCKIN1_PREV_IM = z1_im;
+                LOCKIN1_HAS_PREV = true;
             }
 
             // Build band-limited raw bins 420–460 Hz using effective fs (SAMPLE_RATE/2)
             let bdisp = BAND_DISP.as_mut_ptr();
-            let fs_eff = SAMPLE_RATE * 0.5;
+            let max_bin = fb.len() - 1;
             let bin_hz = fs_eff / (FFT_N as f32);
-            let mut start_bin = ((BAND_MIN_HZ / bin_hz).ceil() as usize).min(max_bin);
-            let mut end_bin = ((BAND_MAX_HZ / bin_hz).floor() as usize).min(max_bin);
+            let cents_ratio = (2.0f32).powf(BAND_SPAN_CENTS / 1200.0);
+            let band_min_hz = BAND_CENTER_HZ / cents_ratio;
+            let band_max_hz = BAND_CENTER_HZ * cents_ratio;
+            let mut start_bin = ((band_min_hz / bin_hz).ceil() as usize).min(max_bin);
+            let mut end_bin = ((band_max_hz / bin_hz).floor() as usize).min(max_bin);
             if end_bin < start_bin { end_bin = start_bin; }
             let mut len = end_bin - start_bin + 1;
             if len > BAND_DISP_CAP { len = BAND_DISP_CAP; }
@@ -264,12 +426,6 @@ pub unsafe extern "C" fn get_last_peak_freq_hz() -> f32 { (LAST_PEAK_BIN as f32)
 #[no_mangle]
 pub unsafe extern "C" fn get_last_peak_mag() -> f32 { LAST_PEAK_MAG }
 
-// FFT display exports
-#[no_mangle]
-pub unsafe extern "C" fn get_fft_display_ptr() -> *const f32 { FFT_DISP.as_ptr() as *const f32 }
-#[no_mangle]
-pub unsafe extern "C" fn get_fft_display_len() -> usize { FFT_DISP_BINS }
-#[no_mangle]
 pub unsafe extern "C" fn get_band_display_ptr() -> *const f32 { BAND_DISP.as_ptr() as *const f32 }
 #[no_mangle]
 pub unsafe extern "C" fn get_band_display_len() -> usize { BAND_LEN }
@@ -284,5 +440,27 @@ pub unsafe extern "C" fn get_super_band_len() -> usize { SUPER_BAND_LEN }
 pub unsafe extern "C" fn get_super_band_start_hz() -> f32 { SUPER_BAND_START_HZ }
 #[no_mangle]
 pub unsafe extern "C" fn get_super_band_bin_hz() -> f32 { SUPER_BAND_BIN_HZ }
+
+// Harmonic outputs
+#[no_mangle]
+pub unsafe extern "C" fn get_harmonics_len() -> usize { HARM_COUNT }
+#[no_mangle]
+pub unsafe extern "C" fn get_harmonics_freq_ptr() -> *const f32 { HARM_FREQS.as_ptr() as *const f32 }
+#[no_mangle]
+pub unsafe extern "C" fn get_harmonics_mag_ptr() -> *const f32 { HARM_MAGS.as_ptr() as *const f32 }
+
+// 2× lock-in exports
+#[no_mangle]
+pub unsafe extern "C" fn get_lockin2_cents() -> f32 { LAST_LOCKIN_2X_CENTS }
+#[no_mangle]
+pub unsafe extern "C" fn get_lockin2_mag() -> f32 { LAST_LOCKIN_2X_MAG }
+#[no_mangle]
+pub unsafe extern "C" fn get_lockin2_ratio() -> f32 { LAST_LOCKIN_2X_RATIO }
+#[no_mangle]
+pub unsafe extern "C" fn get_lockin1_ratio() -> f32 { LAST_LOCKIN_1X_RATIO }
+#[no_mangle]
+pub unsafe extern "C" fn get_lockin1_cents() -> f32 { LAST_LOCKIN_1X_CENTS }
+#[no_mangle]
+pub unsafe extern "C" fn get_lockin1_mag() -> f32 { LAST_LOCKIN_1X_MAG }
 
 

@@ -96,6 +96,67 @@ Notes:
 - Optional: batch 2–4 quanta near window edge to amortize call overhead
 - Accuracy harness: oscillator sweeps → error stats across frequency range
 
+### Idea: Lock‑in demod (beat‑based harmonic ratio error)
+- Goal: directly estimate how far k·f0 is from its ideal ratio without full FFTs per harmonic.
+- Method per harmonic k (2,3,4,6,8):
+  1) Mix by exp(−j 2π k f0_ref t) to bring k·f0 near DC
+  2) Low‑pass + decimate the complex baseband
+  3) Estimate residual beat Δf_k via phase slope: unwrap(arg(x[n+1]·conj(x[n]))) · fs’/(2π)
+  4) Convert to cents: Δcents_k ≈ 1200 · Δf_k / (k·f0_ref · ln 2)
+  5) Magnitude of I/Q gives confidence
+- Pros: O(N·H) per window, low latency, yields sign (above/below) and size in cents directly
+- Plan: implement 2× first; if stable, add 3×, 4×, 6×, 8×
+
+## Harmonic ratio via lock‑in demod (implemented)
+
+This project uses a time‑domain lock‑in (heterodyne) method to measure harmonic ratios with sub‑cent resolution at very low cost.
+
+Workflow (per window):
+- Fundamental reference f0_ref is taken from the super‑resolution peak in the 440±120c band (decimated domain, BH window).
+- For 2× (and extendable to 3×/4×/6×/8×):
+  - Compute complex sum Z = Σ s[n] · e^{−j 2π·(2 f0_ref)·n/fs_eff} over the same BH‑windowed, decimated buffer.
+  - Keep Z_prev from the previous window. Inter‑window phase drift: Δϕ = arg(Z · conj(Z_prev)).
+  - True Δt between window starts is derived from sample counts (Δt = Δsamples/SAMPLE_RATE).
+  - Frequency offset: Δf = Δϕ / (2π Δt).
+  - Ratio and cents: ratio2 = 1 + Δf/(2 f0_ref); cents2 = 1200·log2(ratio2).
+  - Confidence: |Z|/N (energy‑normalized magnitude).
+
+Notes:
+- No FFT magnitudes are used to compute the 2× ratio; the FFT is only used to seed f0_ref. An FFT‑based ratio is shown in the UI as a cross‑check.
+- Inter‑window differencing cancels within‑window bias and gives a stable, small offset. We align absolute phase and use exact Δt from sample counts.
+- Gating policy (domain prior): For harmonic k ≥ 2, optionally report only ratio_k ≥ 1.0 (ignore sub‑ideal estimates); apply an |Z| threshold.
+
+Accuracy & limits:
+- Resolution depends on SNR at k·f0, window length, and reference stability. With light averaging you can approach ~0.1–0.2¢; ~0.5¢ is already observable.
+- Improve with: narrow BPF around k·f0, f64 accumulation for Z, short EMA over inter‑window estimates, and robust f0_ref smoothing.
+- Doesn’t benefit much from larger global FFTs once f0_ref is stable.
+
+Performance:
+- Per harmonic per window: one complex heterodyne + sum (O(N)), one complex multiply for phase drift, a few scalars. Negligible next to the 32k FFT.
+- Adding 3×/4×/6×/8× is almost free.
+
+## Per‑note baseband display (design)
+
+Goal: identical resolution around any note by rendering a fixed ±120 cents baseband.
+
+Two efficient approaches:
+- Zoom‑FFT: heterodyne at f0_ref, decimate, small FFT (e.g., 1024–4096). This yields a uniform cents grid for the spectrum visualization.
+- Probe bank: precompute phasor tables for display bins across ±120c and accumulate short lock‑in magnitudes per bin each window.
+
+Precompute to accelerate:
+- Phasors for heterodyne and per‑bin offsets, BH/Kaiser window and energy, zoom‑FFT twiddles, bin→cents mapping, fixed harmonic marker positions.
+
+## Test signal generation
+
+Use `scripts/gen_tone.py` to generate controlled signals:
+
+```bash
+python3 scripts/gen_tone.py --out public/test_tones/440_2x_eps1e-4.wav \
+  --sr 48000 --dur 15 --f0 440 --eps 0.0001 --a0 0.5 --a2 0.25
+```
+
+This produces a 440 Hz tone plus a 2× partial at +0.01%. Expected: ratio2≈1.000100 (≈0.173¢).
+
 ## Troubleshooting
 - WASM shows fallback
   - Ensure `public/wasm/audio_processor.wasm` exists (`npm run build:wasm`)
