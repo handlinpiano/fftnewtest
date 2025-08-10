@@ -260,68 +260,27 @@ export default function Home() {
               const n = Math.max(0, Math.min(1, v / max));
               return `${i},${1 - n}`;
             }).join(" ");
-            return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#ffaa00" strokeWidth={0.02} points={pts} /></svg>);
+            return (<svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none"><polyline fill="none" stroke="#00ff7f" strokeWidth={0.02} points={pts} /></svg>);
           })()}
           <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>FFT A4 ±120c (raw bins)</div>
         </div>
       )}
       {superBand && (
-        <div style={{ width: "100%", maxWidth: 900, paddingTop: "100%", border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
+        <div style={{ width: "100%", maxWidth: 900, height: 120, border: "1px solid #333", position: "relative", background: "#0b0b0b" }}>
           {(() => {
-            // Zoom to ±15 cents around 440 Hz
-            const a4Hz = 440;
-            const cents = 15;
-            const factor = Math.pow(2, cents / 1200);
-            const fMin = a4Hz / factor;
-            const fMax = a4Hz * factor;
-            const binHz = superBand.binHz;
-            const bandStartHz = superBand.startHz;
-            const totalBins = superBand.mags.length;
-            const startIdx = Math.max(0, Math.floor((fMin - bandStartHz) / binHz));
-            const endIdx = Math.min(totalBins - 1, Math.ceil((fMax - bandStartHz) / binHz));
-            const subStartIdx = Math.min(startIdx, endIdx);
-            const subEndIdx = Math.max(startIdx, endIdx);
-            const subArr = Array.from(superBand.mags.slice(subStartIdx, subEndIdx + 1));
-            const max = subArr.reduce((m, v) => (v > m ? v : m), 0.000001);
-            const L = subArr.length;
-            const pts = subArr.map((v, i) => {
+            const arr = Array.from(superBand.mags);
+            const max = arr.reduce((m, v) => (v > m ? v : m), 0.000001);
+            const pts = arr.map((v, i) => {
               const n = Math.max(0, Math.min(1, v / max));
-              return `${i},${(1 - n) * L}`;
+              return `${i},${1 - n}`;
             }).join(" ");
-
-            // Folded harmonic lines within zoomed band
-            let harmLines = "";
-            if (harm && harm.freqs && harm.freqs.length > 0) {
-              const factors = [2, 3, 4, 6, 8];
-              const colors = ["#ff0000", "#ff9500", "#ffcc00", "#34c759", "#007aff"]; // 2x..8x
-              const freqs = Array.from(harm.freqs);
-              const subStartHz = bandStartHz + subStartIdx * binHz;
-              for (let i = 0; i < freqs.length && i < factors.length; i++) {
-                const n = factors[i];
-                const foldedHz = freqs[i] > 0 ? freqs[i] / n : 0;
-                const fx = (foldedHz - subStartHz) / binHz; // relative to zoomed segment
-                if (fx >= 0 && fx <= subArr.length - 1) {
-                  const color = colors[i] || "#ff6688";
-                  harmLines += `<line x1="${fx}" y1="0" x2="${fx}" y2="${L}" stroke="${color}" stroke-width="3" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-opacity="1" />`;
-                }
-              }
-            }
-
-            // A4 line relative to zoomed segment
-            const subStartHz = bandStartHz + subStartIdx * binHz;
-            const a4x = (a4Hz - subStartHz) / binHz;
-            const a4Line = (a4x >= 0 && a4x <= subArr.length - 1)
-              ? `<line x1="${a4x}" y1="0" x2="${a4x}" y2="${L}" stroke="#ffffff" stroke-width="2" vector-effect="non-scaling-stroke" stroke-opacity="1" stroke-linecap="round" />`
-              : "";
-
             return (
-              <svg style={{ position: "absolute", inset: 0 }} width="100%" height="100%" viewBox={`0 0 ${L} ${L}`} preserveAspectRatio="none">
-                <polyline fill="none" stroke="#33ff88" strokeWidth={0.02} points={pts} />
-                <g dangerouslySetInnerHTML={{ __html: a4Line + harmLines }} />
+              <svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none">
+                <polyline fill="none" stroke="#00ff7f" strokeWidth={0.02} points={pts} />
               </svg>
             );
           })()}
-          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Super-res A4 ±120c {superBand ? `(${superBand.mags.length} bins @ ${superBand.binHz.toFixed(3)} Hz/bin)` : ""}</div>
+          <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>Super-res band</div>
         </div>
       )}
       {harm && (
