@@ -63,6 +63,8 @@ static mut ZOOM_PLAN: Option<std::sync::Arc<dyn Cfft<f32>>> = None;
 static mut ZOOM_HANN: MaybeUninit<[f32; ZOOM_N]> = MaybeUninit::uninit();
 // Super-resolution in baseband: store magnitudes of SHIFT_COUNT shifted FFTs
 static mut ZOOM_SUPER_MAG: MaybeUninit<[f32; ZOOM_N * SHIFT_COUNT]> = MaybeUninit::uninit();
+// Second baseband buffer centered at 2× (for harmonic Goertzel)
+static mut ZOOM2_TIME: MaybeUninit<[Complex32; ZOOM_N]> = MaybeUninit::uninit();
 // Lock-in demod outputs for 2× harmonic
 static mut LAST_LOCKIN_2X_CENTS: f32 = 0.0;
 static mut LAST_LOCKIN_2X_MAG: f32 = 0.0;
@@ -91,6 +93,106 @@ const CAP2_N: usize = 1024; // 32768/1024 = 32x downsample
 const CAP2_DECIM: usize = FFT_N / CAP2_N; // must be integer
 static mut CAP2_MAG: MaybeUninit<[f32; CAP2_N]> = MaybeUninit::uninit();
 static mut CAP2_LEN: usize = 0;
+static mut CAP2_PEAK_IDX: usize = 0;
+static mut CAP2_PEAK_VAL: f32 = 0.0;
+static mut CAP2_PEAK_MS: f32 = 0.0;
+
+// Automatic strike capture of 2× lock-in reading
+const CAPTURE_EARLY_MAX_IDX: usize = 256; // early window region (~170 ms at 48kHz)
+const CAPTURE_MIN_PEAK: f32 = 1e-4;      // minimum demod magnitude to consider attack (more relaxed)
+const CAPTURE_REPLACE_GAIN: f32 = 1.5;  // require new peak >= 1.5x previous captured mag to replace
+const CAPTURE_REFRACTORY_SEC: f32 = 0.25; // ignore new peaks for 250 ms after capture
+static mut CAPTURE_PENDING: bool = false;
+static mut CAPTURE_VALID: bool = false;
+static mut CAPTURE_CENTS: f32 = 0.0;
+static mut CAPTURE_RATIO: f32 = 1.0;
+static mut CAPTURE_MAG: f32 = 0.0;
+static mut CAPTURE_PEAK_MS: f32 = 0.0;
+static mut CAPTURE_PEAK_IDX: usize = 0;
+static mut CAPTURE_LAST_SAMPLES: u64 = 0;
+
+// Sliding-window stability capture: prefer ratio stability directly
+const STAB_WIN: usize = 6;         // number of recent windows to evaluate (slightly shorter)
+const STAB_BUF: usize = 16;        // small ring buffer of recent cents/ratio
+const STAB_MAD_THRESH_CENTS: f32 = 1.00; // fallback threshold in cents (kept for reference)
+const STAB_MAD_THRESH_PPM: f32 = 150.0;  // ratio MAD threshold in ppm
+static mut STAB_CENTS: [f32; STAB_BUF] = [0.0; STAB_BUF]; // still tracked for debug/UI
+static mut STAB_RATIO: [f32; STAB_BUF] = [1.0; STAB_BUF]; // primary stability gate
+static mut STAB_LEN: usize = 0;
+static mut STAB_POS: usize = 0;
+static mut STAB_MAD_LAST: f32 = 0.0;
+static mut STAB_MED_LAST: f32 = 0.0;
+static mut STAB_MAD_PPM_LAST: f32 = 0.0;
+// Continuous best-guess (median of last ratios with light EMA)
+static mut BEST2_RATIO: f32 = 1.0;
+static mut BEST2_CENTS: f32 = 0.0;
+const BEST2_EMA_ALPHA: f32 = 0.25;
+// Hybrid FFT+lock-in estimate
+static mut HYB2_RATIO: f32 = 1.0;
+static mut HYB2_CENTS: f32 = 0.0;
+const HYB_LOCK_WEIGHT_SCALE: f32 = 0.02; // CAP2_PEAK_VAL scale where lock-in gets full weight
+
+// Hidden long-average 2× accumulator (post-attack)
+const LONG2_BUF: usize = 64;
+const LONG2_MIN: usize = 12;
+const LONG2_MAD_THRESH_PPM: f32 = 60.0; // tighter than live gate
+const LONG2_MAX_WINDOWS: usize = 128;
+static mut LONG2_RATIO_RING: [f32; LONG2_BUF] = [1.0; LONG2_BUF];
+static mut LONG2_LEN: usize = 0;
+static mut LONG2_POS: usize = 0;
+static mut LONG2_ACTIVE: bool = false;
+static mut LONG2_READY: bool = false;
+static mut LONG2_RATIO: f32 = 1.0;
+static mut LONG2_CENTS: f32 = 0.0;
+static mut LONG2_WINDOW_COUNT: usize = 0;
+
+// Goertzel/CZT-style dense zoom around A4 (fundamental)
+const GZ_SPAN_CENTS: f32 = 20.0;
+const GZ_STEP_CENTS: f32 = 0.125;
+static mut GZ_BEST_CENTS: f32 = 0.0;
+static mut GZ_BEST_MAG: f32 = 0.0;
+
+#[inline(always)]
+unsafe fn median_inplace(vals: &mut [f32]) -> f32 {
+    // Insertion sort (small N); treat NaNs as large
+    for i in 1..vals.len() {
+        let mut j = i;
+        while j > 0 && (vals[j - 1].is_nan() || (!vals[j].is_nan() && vals[j - 1] > vals[j])) {
+            vals.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    let n = vals.len();
+    if n == 0 { return 0.0; }
+    if n % 2 == 1 { vals[n / 2] } else { 0.5 * (vals[n/2 - 1] + vals[n/2]) }
+}
+
+#[inline(always)]
+unsafe fn compute_mad_cents(buf: &[f32], len: usize, win: usize) -> (f32, f32) {
+    // Returns (median, MAD) over the last `win` values
+    let w = core::cmp::min(core::cmp::min(win, STAB_BUF), len);
+    if w == 0 { return (0.0, f32::INFINITY); }
+    let mut tmp: [f32; STAB_BUF] = [0.0; STAB_BUF];
+    for i in 0..w { tmp[i] = buf[(STAB_POS + STAB_BUF - i - 1) % STAB_BUF]; }
+    let median = median_inplace(&mut tmp[..w]);
+    for i in 0..w { tmp[i] = (tmp[i] - median).abs(); }
+    let mad = median_inplace(&mut tmp[..w]);
+    (median, mad)
+}
+
+#[inline(always)]
+unsafe fn compute_mad_ratio_ppm(buf: &[f32], len: usize, win: usize) -> (f32, f32) {
+    // Median and MAD in ppm for the last `win` ratio values
+    let w = core::cmp::min(core::cmp::min(win, STAB_BUF), len);
+    if w == 0 { return (1.0, f32::INFINITY); }
+    let mut tmp: [f32; STAB_BUF] = [0.0; STAB_BUF];
+    for i in 0..w { tmp[i] = buf[(STAB_POS + STAB_BUF - i - 1) % STAB_BUF]; }
+    let median_r = median_inplace(&mut tmp[..w]);
+    let mut dev: [f32; STAB_BUF] = [0.0; STAB_BUF];
+    for i in 0..w { dev[i] = ((tmp[i] - median_r).abs()) * 1_000_000.0; } // ppm
+    let mad_ppm = median_inplace(&mut dev[..w]);
+    (median_r, mad_ppm)
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn init(capacity: usize) -> *mut f32 {
@@ -332,26 +434,37 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
             // True baseband zoom at 440 Hz: heterodyne + decimate + small FFT
             if let Some(zplan) = &ZOOM_PLAN {
                     let zoom_time = ZOOM_TIME.as_mut_ptr();
+                    let zoom2_time = ZOOM2_TIME.as_mut_ptr();
                     // Mix down at 440 Hz and decimate by ZOOM_DECIM (exact fill of ZOOM_N)
                     let w0 = 2.0 * core::f32::consts::PI * BAND_CENTER_HZ / fs_eff;
+                    let w2 = 2.0 * core::f32::consts::PI * (2.0 * BAND_CENTER_HZ) / fs_eff;
                     let mut zi = 0usize;
                     let mut n_accum = 0usize;
                     let mut acc_re = 0.0f32;
                     let mut acc_im = 0.0f32;
+                    let mut acc2_re = 0.0f32;
+                    let mut acc2_im = 0.0f32;
                     for n in 0..FFT_N {
                         let s = (*timebuf)[n];
                         let ang = w0 * (n as f32);
+                        let ang2 = w2 * (n as f32);
                         // Mix by exp(-j*w0*n) to shift 440 Hz to DC
                         acc_re += s * ang.cos();
                         acc_im += s * -ang.sin();
+                        // Mix by exp(-j*2*w0*n) to shift 2× to DC
+                        acc2_re += s * ang2.cos();
+                        acc2_im += s * -ang2.sin();
                         n_accum += 1;
                         if n_accum == ZOOM_DECIM {
                             // Rectangular average; for sharper passband we could later replace with FIR
                             (*zoom_time)[zi] = Complex32::new(acc_re / (ZOOM_DECIM as f32), acc_im / (ZOOM_DECIM as f32));
+                            (*zoom2_time)[zi] = Complex32::new(acc2_re / (ZOOM_DECIM as f32), acc2_im / (ZOOM_DECIM as f32));
                             zi += 1;
                             n_accum = 0;
                             acc_re = 0.0;
                             acc_im = 0.0;
+                            acc2_re = 0.0;
+                            acc2_im = 0.0;
                         }
                     }
                     if zi == ZOOM_N {
@@ -408,6 +521,71 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                             let m = (*super_mag)[midx as usize];
                             (*zoom_mags)[i] = m;
                         }
+
+                        // Dense Goertzel zoom around A4 (±GZ_SPAN_CENTS) using zoom_time buffer
+                        let mut best_c = 0.0f32;
+                        let mut best_m = 0.0f32;
+                        let c_start = -GZ_SPAN_CENTS;
+                        let c_end = GZ_SPAN_CENTS;
+                        let mut c = c_start;
+                        while c <= c_end + 1e-6 {
+                            // test frequency in Hz around BAND_CENTER_HZ
+                            let f = BAND_CENTER_HZ * (2.0_f32).powf(c / 1200.0);
+                            // in baseband, target is f - BAND_CENTER_HZ
+                            let f_rel = f - BAND_CENTER_HZ;
+                            // complex Goertzel accumulation over ZOOM_N complex samples
+                            let w = 2.0 * core::f32::consts::PI * f_rel / fs_zoom;
+                            let mut re = 0.0f32;
+                            let mut im = 0.0f32;
+                            for k in 0..ZOOM_N {
+                                let v = (*zoom_time)[k];
+                                let ang = w * (k as f32);
+                                re += v.re * ang.cos() - v.im * ang.sin();
+                                im += v.re * ang.sin() + v.im * ang.cos();
+                            }
+                            let m = (re * re + im * im).sqrt();
+                            if m > best_m { best_m = m; best_c = c; }
+                            c += GZ_STEP_CENTS;
+                        }
+                        GZ_BEST_CENTS = best_c;
+                        GZ_BEST_MAG = best_m;
+
+                        // Dense Goertzel micro-bank around 2× (use zoom2_time baseband)
+                        // Sweep ±15 cents with 0.125¢ steps
+                        let span2 = 15.0f32;
+                        let step2 = 0.125f32;
+                        let mut c2 = -span2;
+                        let mut best2_c = 0.0f32;
+                        let mut best2_m = 0.0f32;
+                        while c2 <= span2 + 1e-6 {
+                            // absolute Hz near 2×
+                            let f_abs = 2.0 * BAND_CENTER_HZ * (2.0_f32).powf(c2 / 1200.0);
+                            // relative baseband (center at 2×)
+                            let f_rel2 = f_abs - 2.0 * BAND_CENTER_HZ;
+                            let w2 = 2.0 * core::f32::consts::PI * f_rel2 / fs_zoom;
+                            let mut re2 = 0.0f32;
+                            let mut im2 = 0.0f32;
+                            for k in 0..ZOOM_N {
+                                let v = (*zoom2_time)[k];
+                                let ang = w2 * (k as f32);
+                                re2 += v.re * ang.cos() - v.im * ang.sin();
+                                im2 += v.re * ang.sin() + v.im * ang.cos();
+                            }
+                            let m2 = (re2 * re2 + im2 * im2).sqrt();
+                            if m2 > best2_m { best2_m = m2; best2_c = c2; }
+                            c2 += step2;
+                        }
+                        // Feed this refined 2× into hybrid/snapshot by updating LAST_LOCKIN_2X_RATIO fallback if stronger
+                        let f2_refined = 2.0 * BAND_CENTER_HZ * (2.0_f32).powf(best2_c / 1200.0);
+                        if LAST_PEAK_BIN > 0 {
+                            let coarse = (LAST_PEAK_BIN as f32) * (fs_eff / (FFT_N as f32));
+                            let r_fft_local = if coarse > 0.0 { f2_refined / (2.0 * coarse) } else { 1.0 };
+                            // Prefer refined FFT when demod is weak
+                            if CAP2_PEAK_VAL < 0.005 {
+                                LAST_LOCKIN_2X_RATIO = r_fft_local;
+                                LAST_LOCKIN_2X_CENTS = 1200.0 * (r_fft_local.ln() / core::f32::consts::LN_2);
+                            }
+                        }
                     }
             }
 
@@ -447,6 +625,35 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                     }
                 }
                 CAP2_LEN = core::cmp::min(ci, CAP2_N);
+                // Peak detection in CAP2 buffer and convert to milliseconds (window-relative)
+                let mut pidx = 0usize;
+                let mut pval = 0.0f32;
+                for i in 0..CAP2_LEN { let v = (*cap2)[i]; if v > pval { pval = v; pidx = i; } }
+                CAP2_PEAK_IDX = pidx;
+                CAP2_PEAK_VAL = pval;
+                let dt_per_cap = (CAP2_DECIM as f32) / SAMPLE_RATE; // seconds per CAP2 sample (original fs)
+                CAP2_PEAK_MS = (pidx as f32) * dt_per_cap * 1000.0;
+                // Detect strike peak in early region and latch capture immediately.
+                if pidx > 0 && pidx <= core::cmp::min(CAPTURE_EARLY_MAX_IDX, CAP2_LEN.saturating_sub(1)) && pval >= CAPTURE_MIN_PEAK {
+                    let since_last_sec = ((TOTAL_SAMPLES.saturating_sub(CAPTURE_LAST_SAMPLES)) as f32) / SAMPLE_RATE;
+                    let refractory_ok = since_last_sec >= CAPTURE_REFRACTORY_SEC || CAPTURE_LAST_SAMPLES == 0;
+                    let stronger = (!CAPTURE_VALID) || (pval >= CAPTURE_MAG * CAPTURE_REPLACE_GAIN);
+                    if refractory_ok && stronger {
+                        CAPTURE_CENTS = LAST_LOCKIN_2X_CENTS;
+                        CAPTURE_RATIO = LAST_LOCKIN_2X_RATIO;
+                        CAPTURE_MAG = pval;
+                        CAPTURE_PEAK_IDX = pidx;
+                        CAPTURE_PEAK_MS = CAP2_PEAK_MS;
+                        CAPTURE_VALID = true;
+                        CAPTURE_LAST_SAMPLES = TOTAL_SAMPLES;
+                        // Arm long-average post-attack accumulator
+                        LONG2_ACTIVE = true;
+                        LONG2_READY = false;
+                        LONG2_LEN = 0;
+                        LONG2_POS = 0;
+                        LONG2_WINDOW_COUNT = 0;
+                    }
+                }
                 // Apply absolute phase offset for window start (align to absolute time)
                 let n0_dec = (TOTAL_SAMPLES as f32) * 0.5 - (FFT_N as f32);
                 let phi0 = w * n0_dec;
@@ -473,6 +680,44 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
                     LAST_LOCKIN_2X_RATIO = safe_ratio;
                     LAST_LOCKIN_2X_CENTS = cents.clamp(-50.0, 50.0);
                     LAST_LOCKIN_2X_MAG = mag;
+                    // Sliding stability capture over recent windows
+                    STAB_CENTS[STAB_POS] = LAST_LOCKIN_2X_CENTS;
+                    STAB_RATIO[STAB_POS] = LAST_LOCKIN_2X_RATIO;
+                    STAB_POS = (STAB_POS + 1) % STAB_BUF;
+                    if STAB_LEN < STAB_BUF { STAB_LEN += 1; }
+                    let (med_c, mad_c) = compute_mad_cents(&STAB_CENTS, STAB_LEN, STAB_WIN);
+                    let (med_r, mad_ppm) = compute_mad_ratio_ppm(&STAB_RATIO, STAB_LEN, STAB_WIN);
+                    // Continuous best-guess: EMA of median ratio
+                    let prev = BEST2_RATIO;
+                    BEST2_RATIO = prev + BEST2_EMA_ALPHA * (med_r - prev);
+                    BEST2_CENTS = 1200.0 * (BEST2_RATIO.ln() / core::f32::consts::LN_2);
+                    STAB_MED_LAST = med_c;
+                    STAB_MAD_LAST = mad_c;
+                    STAB_MAD_PPM_LAST = mad_ppm;
+                    // Prefer ratio stability in ppm; fallback to cents gate
+                    let ratio_stable = mad_ppm.is_finite() && mad_ppm <= STAB_MAD_THRESH_PPM;
+                    let cents_stable = mad_c.is_finite() && mad_c <= STAB_MAD_THRESH_CENTS;
+                    if !CAPTURE_VALID && (ratio_stable || cents_stable) {
+                        CAPTURE_RATIO = med_r;
+                        CAPTURE_CENTS = 1200.0 * (med_r.ln() / core::f32::consts::LN_2);
+                        CAPTURE_MAG = LAST_LOCKIN_2X_MAG;
+                        CAPTURE_VALID = true;
+                        CAPTURE_LAST_SAMPLES = TOTAL_SAMPLES;
+                    }
+
+                    // Hybrid FFT + lock-in ratio
+                    let mut fft_ratio2 = 1.0f32;
+                    if f0_ref_hz > 0.0 {
+                        let h2 = unsafe { HARM_FREQS.assume_init()[0] };
+                        let denom = 2.0 * f0_ref_hz;
+                        if h2 > 0.0 && denom > 0.0 { fft_ratio2 = h2 / denom; }
+                    }
+                    let lock_ratio = LAST_LOCKIN_2X_RATIO;
+                    let mut w = CAP2_PEAK_VAL / HYB_LOCK_WEIGHT_SCALE;
+                    if w < 0.0 { w = 0.0; } else if w > 1.0 { w = 1.0; }
+                    let hyb_r = w * lock_ratio + (1.0 - w) * fft_ratio2;
+                    HYB2_RATIO = hyb_r;
+                    HYB2_CENTS = 1200.0 * (hyb_r.ln() / core::f32::consts::LN_2);
                 }
                 // Update previous state
                 LOCKIN2_PREV_RE = z_re;
@@ -541,6 +786,35 @@ pub unsafe extern "C" fn process_quantum(n: usize) {
             BAND_LEN = len;
             BAND_START_BIN = start_bin;
         }
+                    // Long-average accumulation (hidden)
+                    if LONG2_ACTIVE && !LONG2_READY {
+                        LONG2_RATIO_RING[LONG2_POS] = LAST_LOCKIN_2X_RATIO;
+                        LONG2_POS = (LONG2_POS + 1) % LONG2_BUF;
+                        if LONG2_LEN < LONG2_BUF { LONG2_LEN += 1; }
+                        LONG2_WINDOW_COUNT += 1;
+                        if LONG2_LEN >= LONG2_MIN {
+                            let (_mr, mad_ppm) = compute_mad_ratio_ppm(&LONG2_RATIO_RING, LONG2_LEN, LONG2_LEN);
+                            if mad_ppm.is_finite() && mad_ppm <= LONG2_MAD_THRESH_PPM {
+                                // Freeze
+                                let mut tmp: [f32; LONG2_BUF] = [0.0; LONG2_BUF];
+                                for i in 0..LONG2_LEN { tmp[i] = LONG2_RATIO_RING[i]; }
+                                let med = median_inplace(&mut tmp[..LONG2_LEN]);
+                                LONG2_RATIO = med;
+                                LONG2_CENTS = 1200.0 * (med.ln() / core::f32::consts::LN_2);
+                                LONG2_READY = true;
+                                LONG2_ACTIVE = false;
+                            } else if LONG2_WINDOW_COUNT >= LONG2_MAX_WINDOWS {
+                                // Give up and freeze best median so far
+                                let mut tmp: [f32; LONG2_BUF] = [0.0; LONG2_BUF];
+                                for i in 0..LONG2_LEN { tmp[i] = LONG2_RATIO_RING[i]; }
+                                let med = median_inplace(&mut tmp[..LONG2_LEN]);
+                                LONG2_RATIO = med;
+                                LONG2_CENTS = 1200.0 * (med.ln() / core::f32::consts::LN_2);
+                                LONG2_READY = true;
+                                LONG2_ACTIVE = false;
+                            }
+                        }
+                    }
     }
 }
 
@@ -613,5 +887,58 @@ pub unsafe extern "C" fn get_zoom_bin_cents() -> f32 { ZOOM_BIN_CENTS }
 pub unsafe extern "C" fn get_cap2_ptr() -> *const f32 { CAP2_MAG.as_ptr() as *const f32 }
 #[no_mangle]
 pub unsafe extern "C" fn get_cap2_len() -> usize { CAP2_LEN }
+#[no_mangle]
+pub unsafe extern "C" fn get_cap2_peak_idx() -> usize { CAP2_PEAK_IDX }
+#[no_mangle]
+pub unsafe extern "C" fn get_cap2_peak_val() -> f32 { CAP2_PEAK_VAL }
+#[no_mangle]
+pub unsafe extern "C" fn get_cap2_peak_ms() -> f32 { CAP2_PEAK_MS }
+
+// Post-attack captured reading exports
+#[no_mangle]
+pub unsafe extern "C" fn get_capture_valid() -> i32 { if CAPTURE_VALID { 1 } else { 0 } }
+#[no_mangle]
+pub unsafe extern "C" fn get_capture_cents() -> f32 { CAPTURE_CENTS }
+#[no_mangle]
+pub unsafe extern "C" fn get_capture_ratio() -> f32 { CAPTURE_RATIO }
+#[no_mangle]
+pub unsafe extern "C" fn get_capture_mag() -> f32 { CAPTURE_MAG }
+#[no_mangle]
+pub unsafe extern "C" fn get_capture_peak_ms() -> f32 { CAPTURE_PEAK_MS }
+#[no_mangle]
+pub unsafe extern "C" fn reset_capture() {
+    CAPTURE_VALID = false;
+    CAPTURE_LAST_SAMPLES = 0;
+    CAPTURE_MAG = 0.0;
+}
+
+// Continuous best-guess exports
+#[no_mangle]
+pub unsafe extern "C" fn get_best2_ratio() -> f32 { BEST2_RATIO }
+#[no_mangle]
+pub unsafe extern "C" fn get_best2_cents() -> f32 { BEST2_CENTS }
+#[no_mangle]
+pub unsafe extern "C" fn get_hybrid2_ratio() -> f32 { HYB2_RATIO }
+#[no_mangle]
+pub unsafe extern "C" fn get_hybrid2_cents() -> f32 { HYB2_CENTS }
+// Debug stability exports
+#[no_mangle]
+pub unsafe extern "C" fn get_debug_stab_med_cents() -> f32 { STAB_MED_LAST }
+#[no_mangle]
+pub unsafe extern "C" fn get_debug_stab_mad_cents() -> f32 { STAB_MAD_LAST }
+#[no_mangle]
+pub unsafe extern "C" fn get_debug_stab_mad_ppm() -> f32 { STAB_MAD_PPM_LAST }
+// Long-average exports
+#[no_mangle]
+pub unsafe extern "C" fn get_long2_ready() -> i32 { if LONG2_READY { 1 } else { 0 } }
+#[no_mangle]
+pub unsafe extern "C" fn get_long2_ratio() -> f32 { LONG2_RATIO }
+#[no_mangle]
+pub unsafe extern "C" fn get_long2_cents() -> f32 { LONG2_CENTS }
+// Goertzel zoom exports
+#[no_mangle]
+pub unsafe extern "C" fn get_gz_best_cents() -> f32 { GZ_BEST_CENTS }
+#[no_mangle]
+pub unsafe extern "C" fn get_gz_best_mag() -> f32 { GZ_BEST_MAG }
 
 

@@ -14,6 +14,17 @@ class PassthroughProcessor extends AudioWorkletProcessor {
     this.sharedIndex = null;
 
     this.port.onmessage = async (e) => {
+      if (e.data?.type === 'beat-config') {
+        // Store simple beat configuration for future generic detector
+        const { mode, harmonics } = e.data;
+        this.beatMode = mode === 'coincident' ? 'coincident' : 'unison';
+        this.beatHarmonics = Array.isArray(harmonics) ? harmonics.filter((k) => Number.isFinite(k)).slice(0, 8) : [2];
+        return;
+      }
+      if (e.data?.type === 'reset-capture') {
+        try { this.wasm?.exports?.reset_capture?.(); } catch {}
+        return;
+      }
       if (e.data?.type === 'init') {
         const { dataSAB, indexSAB, capacity } = e.data;
         this.capacity = capacity >>> 0;
@@ -169,15 +180,64 @@ class PassthroughProcessor extends AudioWorkletProcessor {
             }
           }
 
-          // 2× capture buffer
+          // 2× capture buffer (+peak index/value/ms)
           let cap2Copy = null;
+          let cap2PeakIdx = undefined;
+          let cap2PeakVal = undefined;
+          let cap2PeakMs = undefined;
           if (this.wasm.exports.get_cap2_ptr && this.wasm.exports.get_cap2_len) {
             const cptr = this.wasm.exports.get_cap2_ptr();
             const clen = this.wasm.exports.get_cap2_len();
             if (cptr && clen) cap2Copy = new Float32Array(this.mem.buffer, cptr, clen).slice();
           }
+          if (this.wasm.exports.get_cap2_peak_idx) cap2PeakIdx = this.wasm.exports.get_cap2_peak_idx();
+          if (this.wasm.exports.get_cap2_peak_val) cap2PeakVal = this.wasm.exports.get_cap2_peak_val();
+          if (this.wasm.exports.get_cap2_peak_ms) cap2PeakMs = this.wasm.exports.get_cap2_peak_ms();
 
-          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen, harm, lockin2Cents, lockin2Mag, lockin2Ratio, zoomMags: zoomCopy, zoomStartCents, zoomBinCents, cap2: cap2Copy };
+          // Post-attack captured reading
+          let capture = null;
+          if (this.wasm.exports.get_capture_valid && this.wasm.exports.get_capture_valid()) {
+            const cents = this.wasm.exports.get_capture_cents ? this.wasm.exports.get_capture_cents() : 0;
+            const ratio = this.wasm.exports.get_capture_ratio ? this.wasm.exports.get_capture_ratio() : 1;
+            const cmag = this.wasm.exports.get_capture_mag ? this.wasm.exports.get_capture_mag() : 0;
+            const pms = this.wasm.exports.get_capture_peak_ms ? this.wasm.exports.get_capture_peak_ms() : 0;
+            capture = { cents, ratio, mag: cmag, peakMs: pms };
+          }
+          // Continuous best-guess (median+EMA)
+          let best2 = null;
+          if (this.wasm.exports.get_best2_ratio) {
+            const br = this.wasm.exports.get_best2_ratio();
+            const bc = this.wasm.exports.get_best2_cents ? this.wasm.exports.get_best2_cents() : 0;
+            best2 = { ratio: br, cents: bc };
+          }
+          let dbg = null;
+          if (this.wasm.exports.get_debug_stab_med_cents) {
+            const medc = this.wasm.exports.get_debug_stab_med_cents();
+            const madc = this.wasm.exports.get_debug_stab_mad_cents ? this.wasm.exports.get_debug_stab_mad_cents() : 0;
+            const madppm = this.wasm.exports.get_debug_stab_mad_ppm ? this.wasm.exports.get_debug_stab_mad_ppm() : 0;
+            dbg = { medC: medc, madC: madc, madPpm: madppm };
+          }
+          let hybrid2 = null;
+          if (this.wasm.exports.get_hybrid2_ratio) {
+            const hr = this.wasm.exports.get_hybrid2_ratio();
+            const hc = this.wasm.exports.get_hybrid2_cents ? this.wasm.exports.get_hybrid2_cents() : 0;
+            hybrid2 = { ratio: hr, cents: hc };
+          }
+          let long2 = null;
+          if (this.wasm.exports.get_long2_ready && this.wasm.exports.get_long2_ready()) {
+            const lr = this.wasm.exports.get_long2_ratio ? this.wasm.exports.get_long2_ratio() : 1;
+            const lc = this.wasm.exports.get_long2_cents ? this.wasm.exports.get_long2_cents() : 0;
+            long2 = { ratio: lr, cents: lc };
+          }
+          let gz = null;
+          if (this.wasm.exports.get_gz_best_cents) {
+            const gc = this.wasm.exports.get_gz_best_cents();
+            const gm = this.wasm.exports.get_gz_best_mag ? this.wasm.exports.get_gz_best_mag() : 0;
+            gz = { cents: gc, mag: gm };
+          }
+          // Optional: expose debug stability stats (if exported later)
+
+          const payload = { type: 'metrics', rms, peak, bin, freqHz, mag, band: bdispCopy, bandStartBin: bstart, superBand: sCopy, superStartHz: sst, superBinHz: sbin, bandLen: blen, harm, lockin2Cents, lockin2Mag, lockin2Ratio, zoomMags: zoomCopy, zoomStartCents, zoomBinCents, cap2: cap2Copy, cap2PeakIdx, cap2PeakVal, cap2PeakMs, capture, best2, hybrid2, long2, dbg, gz };
           if (includeTiming && this.procCount) {
             payload.procMsAvg = this.procSumMs / this.procCount;
             payload.procMsMax = this.procMaxMs || 0;

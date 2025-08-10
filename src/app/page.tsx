@@ -27,10 +27,27 @@ export default function Home() {
   const [zoom, setZoom] = useState<{ mags: Float32Array; startCents: number; binCents: number } | null>(null);
   const [harm, setHarm] = useState<{ freqs: Float32Array; mags: Float32Array } | null>(null);
   const [cap2, setCap2] = useState<Float32Array | null>(null);
+  const [cap2Peak, setCap2Peak] = useState<{ idx: number; val: number; ms: number } | null>(null);
+  const [cap2Captured, setCap2Captured] = useState<{ cents: number; ratio: number; mag: number; peakMs: number } | null>(null);
+  const [best2, setBest2] = useState<{ cents: number; ratio: number } | null>(null);
+  const [hyb2, setHyb2] = useState<{ cents: number; ratio: number } | null>(null);
+  const [long2, setLong2] = useState<{ cents: number; ratio: number } | null>(null);
+  const [dbg, setDbg] = useState<{ medC: number; madC: number; madPpm: number } | null>(null);
+  const [gz, setGz] = useState<{ cents: number; mag: number } | null>(null);
   const [lock2, setLock2] = useState<{ cents: number; mag: number } | null>(null);
   const [lock2Ratio, setLock2Ratio] = useState<number | null>(null);
   const sabDataRef = useRef<Float32Array | null>(null);
   const sabIndexRef = useRef<Int32Array | null>(null);
+  // Beat detector controls (refactor scaffolding)
+  const [beatMode, setBeatMode] = useState<"unison" | "coincident">("unison");
+  const [allHarm, setAllHarm] = useState<boolean>(false);
+  const [selectedKs, setSelectedKs] = useState<number[]>([2]);
+
+  function postBeatConfig(node: AudioWorkletNode | null) {
+    try {
+      node?.port?.postMessage({ type: "beat-config", mode: beatMode, harmonics: allHarm ? [1,2,3,4,5,6,7,8] : selectedKs });
+    } catch {}
+  }
 
   useEffect(() => {
     function draw() {
@@ -157,6 +174,28 @@ export default function Home() {
           if (e.data.cap2) {
             setCap2(e.data.cap2 as Float32Array);
           }
+          if (e.data.cap2PeakIdx !== undefined && e.data.cap2PeakVal !== undefined && e.data.cap2PeakMs !== undefined) {
+            setCap2Peak({ idx: e.data.cap2PeakIdx as number, val: e.data.cap2PeakVal as number, ms: e.data.cap2PeakMs as number });
+          }
+          if (e.data.capture) {
+            const c = e.data.capture as { cents: number; ratio: number; mag: number; peakMs: number };
+            setCap2Captured(c);
+          }
+          if (e.data.best2) {
+            setBest2(e.data.best2 as { cents: number; ratio: number });
+          }
+          if (e.data.hybrid2) {
+            setHyb2(e.data.hybrid2 as { cents: number; ratio: number });
+          }
+          if (e.data.long2) {
+            setLong2(e.data.long2 as { cents: number; ratio: number });
+          }
+          if (e.data.dbg) {
+            setDbg(e.data.dbg as { medC: number; madC: number; madPpm: number });
+          }
+          if (e.data.gz) {
+            setGz(e.data.gz as { cents: number; mag: number });
+          }
           if (e.data.procMsAvg !== undefined) {
             setProcStats({
               avgMs: e.data.procMsAvg as number,
@@ -176,6 +215,8 @@ export default function Home() {
       sabDataRef.current = new Float32Array(dataSAB);
       sabIndexRef.current = new Int32Array(indexSAB);
       node.port.postMessage({ type: "init", dataSAB, indexSAB, capacity });
+      // Send initial beat-config
+      postBeatConfig(node);
 
       // Load wasm bytes on main thread and send to worklet for instantiation
       try {
@@ -231,8 +272,84 @@ export default function Home() {
         <button onClick={isRunning ? stop : start}>{isRunning ? "Stop" : "Start"}</button>
         {error && <span style={{ color: "tomato" }}>{error}</span>}
       </div>
+      {/* Beat detector controls (harmonic presets 1–8, All toggle, mode) */}
+      <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", color: "#ccc" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span>Mode:</span>
+          <label style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <input
+              type="radio"
+              name="beat-mode"
+              checked={beatMode === "unison"}
+              onChange={() => {
+                setBeatMode("unison");
+                postBeatConfig(workletNodeRef.current);
+              }}
+            />
+            Unison
+          </label>
+          <label style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <input
+              type="radio"
+              name="beat-mode"
+              checked={beatMode === "coincident"}
+              onChange={() => {
+                setBeatMode("coincident");
+                postBeatConfig(workletNodeRef.current);
+              }}
+            />
+            Coincident
+          </label>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={allHarm}
+              onChange={(e) => {
+                const v = e.currentTarget.checked;
+                setAllHarm(v);
+                if (v) setSelectedKs([1,2,3,4,5,6,7,8]);
+                postBeatConfig(workletNodeRef.current);
+              }}
+            />
+            All (1–8)
+          </label>
+          {!allHarm && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {[1,2,3,4,5,6,7,8].map((k) => (
+                <label key={k} style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedKs.includes(k)}
+                    onChange={(e) => {
+                      const checked = e.currentTarget.checked;
+                      setSelectedKs((prev) => {
+                        let next = prev.slice();
+                        if (checked) {
+                          if (!next.includes(k)) next = [...next, k].sort((a,b) => a-b);
+                        } else {
+                          next = next.filter((x) => x !== k);
+                          if (next.length === 0) next = [2];
+                        }
+                        // Post after state update
+                        setTimeout(() => postBeatConfig(workletNodeRef.current), 0);
+                        return next;
+                      });
+                    }}
+                  />
+                  {k}×
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
       <div style={{ color: wasmReady ? "#2ecc71" : wasmReady === false ? "#e74c3c" : "#888" }}>
         WASM: {wasmReady === null ? "pending" : wasmReady ? "active" : "fallback"}
+      </div>
+      <div style={{ color: "#888" }}>
+        Beat: {beatMode} | harmonics: {(allHarm ? [1,2,3,4,5,6,7,8] : selectedKs).join(", ")}
       </div>
       <div style={{ color: "#888" }}>RMS: {rms !== null ? rms.toFixed(7) : "—"} {peak !== null ? ` | pk ${peak.toFixed(5)}` : ""}</div>
       <div style={{ color: "#888" }}>
@@ -292,6 +409,11 @@ export default function Home() {
                   const zeroIdx = Math.round((-zoom.startCents) / zoom.binCents);
                   return <line x1={zeroIdx} y1={0} x2={zeroIdx} y2={viewW} stroke="#ffffff" strokeWidth={2} vectorEffect="non-scaling-stroke" />;
                 })()}
+                {(() => {
+                  if (!gz) return null;
+                  const x = Math.round((gz.cents - zoom.startCents) / zoom.binCents);
+                  return <line x1={x} y1={0} x2={x} y2={viewW} stroke="#ff4444" strokeWidth={2} vectorEffect="non-scaling-stroke" />;
+                })()}
               </svg>
             );
           })()}
@@ -329,11 +451,38 @@ export default function Home() {
                 <svg width="100%" height="100%" viewBox={`0 0 ${arr.length} 1`} preserveAspectRatio="none">
                   <polyline fill="none" stroke="#ffcc00" strokeWidth={0.02} points={pts} />
                 </svg>
-                <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>2× lock-in capture (per-window, coarse magnitude)</div>
+                <div style={{ position: "absolute", top: 4, left: 8, color: "#888", fontSize: 12 }}>2× lock-in capture (beat envelope)</div>
               </>
             );
           })()}
         </div>
+      )}
+      {cap2Peak && (
+        <div style={{ color: "#ccc" }}>2× capture peak: idx {cap2Peak.idx}, val {cap2Peak.val.toFixed(6)}, t ≈ {cap2Peak.ms.toFixed(2)} ms</div>
+      )}
+      {cap2Captured && (
+        <div style={{ color: "#6cf", display: "flex", gap: 8, alignItems: "center" }}>
+          <span>Captured 2× (post-attack): {cap2Captured.cents.toFixed(2)}¢ | mag {cap2Captured.mag.toFixed(3)}</span>
+          <button onClick={() => {
+            try { (workletNodeRef.current as any)?.port?.postMessage({ type: "reset-capture" }); } catch {}
+            setCap2Captured(null);
+          }}>Reset</button>
+        </div>
+      )}
+      {best2 && (
+        <div style={{ color: "#9f9" }}>Best-guess 2×: {best2.cents.toFixed(2)}¢ (ratio {best2.ratio.toFixed(9)})</div>
+      )}
+      {hyb2 && (
+        <div style={{ color: "#ffd700" }}>Hybrid 2×: {hyb2.cents.toFixed(2)}¢ (ratio {hyb2.ratio.toFixed(9)})</div>
+      )}
+      {long2 && (
+        <div style={{ color: "#7ec8e3" }}>Long-average 2×: {long2.cents.toFixed(2)}¢ (ratio {long2.ratio.toFixed(9)})</div>
+      )}
+      {dbg && (
+        <div style={{ color: "#aaa", fontSize: 12 }}>Debug: med {dbg.medC.toFixed(3)}¢ | MAD {dbg.madC.toFixed(3)}¢ | MAD {dbg.madPpm.toFixed(1)} ppm</div>
+      )}
+      {gz && (
+        <div style={{ color: "#ccc", fontSize: 12 }}>Goertzel zoom: {gz.cents.toFixed(2)}¢ (mag {gz.mag.toFixed(3)})</div>
       )}
       <div style={{ color: "#888" }}>quanta: {stats.quanta} | writePos: {stats.writePos} | quanta/sec: {qps.toFixed(1)}</div>
       <p style={{ color: "#666" }}>This draws the latest 128-sample quantum from the AudioWorklet.</p>
