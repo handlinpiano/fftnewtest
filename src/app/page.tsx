@@ -23,7 +23,7 @@ export default function Home() {
   const silentDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const animationRef = useRef<number | null>(null);
   const [fftBand, setFftBand] = useState<Float32Array | null>(null);
-  const [superBand, setSuperBand] = useState<{ mags: Float32Array; startHz: number; binHz: number } | null>(null);
+  const [superBand] = useState<{ mags: Float32Array; startHz: number; binHz: number } | null>(null);
   const [zoom, setZoom] = useState<{ mags: Float32Array; startCents: number; binCents: number } | null>(null);
   const [harm, setHarm] = useState<{ freqs: Float32Array; mags: Float32Array } | null>(null);
   const [cap2, setCap2] = useState<Float32Array | null>(null);
@@ -157,8 +157,7 @@ export default function Home() {
           if (e.data.band) {
             setFftBand(e.data.band as Float32Array);
           }
-          // superBand disabled for battery test
-          setSuperBand(null);
+          // superBand disabled for battery test (no-op)
           if (e.data.harm) {
             setHarm({ freqs: e.data.harm.freqs as Float32Array, mags: e.data.harm.mags as Float32Array });
           }
@@ -464,7 +463,10 @@ export default function Home() {
         <div style={{ color: "#6cf", display: "flex", gap: 8, alignItems: "center" }}>
           <span>Captured 2× (post-attack): {cap2Captured.cents.toFixed(2)}¢ | mag {cap2Captured.mag.toFixed(3)}</span>
           <button onClick={() => {
-            try { (workletNodeRef.current as any)?.port?.postMessage({ type: "reset-capture" }); } catch {}
+            try {
+              const n = workletNodeRef.current as unknown as { port?: MessagePort } | null;
+              n?.port?.postMessage({ type: "reset-capture" });
+            } catch {}
             setCap2Captured(null);
           }}>Reset</button>
         </div>
