@@ -172,5 +172,12 @@ This produces a 440 Hz tone plus a 2× partial at +0.01%. Expected: ratio2≈1.0
 - `npm run dev` — Next.js dev server (Turbopack)
 - `npm run build` — Next.js production build
 - `npm run start` — Start production server
-- ` n yg,yiug.jb ;ol/    run lint` — ESLint
+- `npm run lint` — ESLint
+
+## DSP technique references
+
+- Baseband zoom‑FFT (heterodyne + decimate + small complex FFT): see `docs/BASEBAND_ZOOM_FFT.md`
+- Goertzel zoom and micro‑bank around harmonics: see `docs/GOERTZEL_ZOOM.md`
+- Lock‑in demodulation (inter‑window phase drift) for sub‑cent offsets: see `docs/LOCKIN_DEMOD.md`
+- Hybrid ratio, capture logic, and stability gating (MAD): see `docs/HYBRID_AND_CAPTURE.md`
 - `npm run build:wasm` — Build Rust WASM → `public/wasm/audio_processor.wasm`
